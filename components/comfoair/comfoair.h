@@ -326,6 +326,8 @@ public:
   void set_proxy_uart(uart::UARTComponent *proxy_uart) { proxy_uart_ = proxy_uart; }
   // Log every byte received from the unit (and the panel) as hex, for protocol debugging.
   void set_log_raw_bytes(bool log_raw_bytes) { log_raw_bytes_ = log_raw_bytes; }
+  // Test aid: answer the panel's temperature poll with fake values (proxy mode only).
+  void set_test_fake_unit_reply(bool value) { test_fake_unit_reply_ = value; }
   bool set_unit_size(uint8_t raw_size);
   void set_size_select(ComfoAirSizeSelect *size_select);
 
@@ -449,6 +451,10 @@ protected:
       if (checkRx_(csRxBuffer_au8, &csRxIdx_u8, byte_u8) == RX_STATUS_RECEIVED_MESSAGE)
       {
         arbiter_.panel_frame_complete(millis());
+        if (test_fake_unit_reply_ && !arbiter_.own_exchange())
+        {
+          send_fake_unit_reply_(csRxBuffer_au8[1]);
+        }
       }
 
       if (arbiter_.own_exchange() || !hold_.empty())
@@ -520,6 +526,31 @@ protected:
     {
       start_own_exchange_(now);
     }
+  }
+
+  // Hardware test aid (test_fake_unit_reply: true): answer the panel's temperature poll
+  // ourselves, as if we were the unit, to prove that the ESP -> ComfoSense path works.
+  // The panel should display these values: comfort 22.0, outside 11.5, supply 17.5,
+  // extract 21.5 and exhaust 8.5 degrees C.
+  void send_fake_unit_reply_(uint8_t request_command)
+  {
+    if (request_command != CMD_GET_TEMPERATURES)
+    {
+      return;
+    }
+    uint8_t message_au8[MAX_MESSAGE_SIZE]{};
+    message_au8[1] = RES_GET_TEMPERATURES;
+    message_au8[2] = 9;
+    const uint8_t data[9] = {84, 63, 75, 83, 57, 0x0F, 0, 0, 0};
+    memcpy(&message_au8[3], data, sizeof(data));
+
+    uint8_t frame_au8[MAX_MESSAGE_SIZE];
+    const uint8_t frame_len = encodeMessage_(message_au8, frame_au8);
+    proxy_uart_->write_byte(COMMAND_PREFIX);
+    proxy_uart_->write_byte(COMMAND_HEAD_ACK);
+    proxy_uart_->write_array(frame_au8, frame_len);
+    proxy_uart_->flush();
+    ESP_LOGI(TAG, "Test: answered ComfoSense temperature request with fake values");
   }
 
   void start_own_exchange_(uint32_t now)
@@ -656,19 +687,15 @@ protected:
     txMessage_(message_au8_au8);
   }
 
-  // add prefix, second 0x07, checksum and postfix and transmit that data.
-  void txMessage_(uint8_t message_au8[] /*, tx_serial txPort_en */)
+  // add prefix, second 0x07, checksum and postfix. Returns the length of the encoded frame.
+  uint8_t encodeMessage_(uint8_t message_au8[], uint8_t txBuffer_au8[])
   {
     // add 2 bytes "START"
     // copy "COMMAND" and "SIZE"
     // copy "DATA" and double each 0x07 in data area
     // add "CHECKSUM" and escape it when needed
     // add 2 bytes "STOP"
-    // transmit everything to Serial
 
-    ESP_LOGVV(TAG, "TX: cmd: %02X size: %u", message_au8[1], message_au8[2]);
-
-    uint8_t txBuffer_au8[MAX_MESSAGE_SIZE]; // TX buffer
     // Start
     txBuffer_au8[0] = 0x07;
     txBuffer_au8[1] = 0xF0;
@@ -706,40 +733,16 @@ protected:
     txBuffer_au8[idx_txBuffer_u8] = 0x07;
     idx_txBuffer_u8++;
     txBuffer_au8[idx_txBuffer_u8] = 0x0F;
+    return idx_txBuffer_u8 + 1U;
+  }
 
-    // todo for future use when ComfoAir and ComfoSense are both
-    // connected to an individual UART on this ESP32:
-    // Either send to CA or CS
-    //
-    // transmit
-    // idx_message_u8 = 0U;
-    // switch (txPort_en)
-    // {
-    // case SERIAL_0_PC:
-    //   while (idx_message_u8 <= idx_txBuffer_u8)
-    //   {
-    //     Serial.write(txBuffer_au8[idx_message_u8]);
-    //     idx_message_u8++;
-    //   }
-    //   break;
-    // case SERIAL_1_ComfoAir:
-    //   while (idx_message_u8 <= idx_txBuffer_u8)
-    //   {
-    //     Serial1.write(txBuffer_au8[idx_message_u8]);
-    //     idx_message_u8++;
-    //   }
-    //   break;
-    // case SERIAL_2_ComfoSense:
-    //   while (idx_message_u8 <= idx_txBuffer_u8)
-    //   {
-    //     Serial2.write(txBuffer_au8[idx_message_u8]);
-    //     idx_message_u8++;
-    //   }
-    //   break;
-    // default:
-    //   break;
-    // }
-    idx_txBuffer_u8++;
+  // encode and transmit that data. With a proxy UART the frame is queued instead.
+  void txMessage_(uint8_t message_au8[])
+  {
+    ESP_LOGVV(TAG, "TX: cmd: %02X size: %u", message_au8[1], message_au8[2]);
+
+    uint8_t txBuffer_au8[MAX_MESSAGE_SIZE]; // TX buffer
+    uint8_t idx_txBuffer_u8 = encodeMessage_(message_au8, txBuffer_au8);
     if (proxy_uart_ != nullptr)
     {
       // The bus is shared with the ComfoSense panel; wait for an idle gap.
@@ -1620,6 +1623,7 @@ protected:
   bool retry_pending_{false};
   HighFrequencyLoopRequester high_freq_;
   bool log_raw_bytes_{false};
+  bool test_fake_unit_reply_{false};
   RawByteCollector unit_raw_;
   RawByteCollector panel_raw_;
 

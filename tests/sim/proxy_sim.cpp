@@ -195,12 +195,33 @@ static void test_legacy_mode()
   CHECK(r.unit.tx == ACK); // ACKs every message itself
 }
 
+// The fake-reply test aid answers the panel's temperature poll, and only that.
+static void test_fake_unit_reply()
+{
+  Rig r(true);
+  r.c.set_test_fake_unit_reply(true);
+  r.panel.feed(frame(CMD_GET_FAN_STATUS, {}));
+  r.run(10);
+  CHECK(r.panel.tx.empty()); // other requests are not answered
+
+  r.panel.feed(frame(CMD_GET_TEMPERATURES, {}));
+  r.run(10);
+  Bytes expected = concat(ACK, frame(RES_GET_TEMPERATURES, {84, 63, 75, 83, 57, 0x0F, 0, 0, 0}));
+  CHECK(r.panel.tx == expected);
+
+  Rig off(true); // disabled by default
+  off.panel.feed(frame(CMD_GET_TEMPERATURES, {}));
+  off.run(10);
+  CHECK(off.panel.tx.empty());
+}
+
 int main()
 {
   test_transparent_relay();
   test_injection_and_hold();
   test_timeout_retry();
   test_legacy_mode();
+  test_fake_unit_reply();
   std::printf("all proxy simulation tests passed\n");
   return 0;
 }
