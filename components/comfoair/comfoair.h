@@ -179,7 +179,6 @@ public:
     {
       ESP_LOGCONFIG(TAG, "  CC-Luxe v%0d.%02d", *(p + 13) >> 4, *(p + 13) & 0x0f);
     }
-    check_uart_settings(9600);
     if (proxy_uart_ != nullptr)
     {
       ESP_LOGCONFIG(TAG, "  ComfoSense proxy: enabled (frames from Home Assistant wait for an idle bus)");

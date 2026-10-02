@@ -689,6 +689,26 @@ def validate_proxy_uart(config):
     return config
 
 
+def final_validate(config):
+    """Require 9600 8N1 on the UART(s), replacing the runtime check_uart_settings()."""
+    uart_requirements = {
+        "baud_rate": 9600,
+        "data_bits": 8,
+        "parity": "NONE",
+        "stop_bits": 1,
+        "require_tx": True,
+        "require_rx": True,
+    }
+    uart.final_validate_device_schema("comfoair", **uart_requirements)(config)
+    if CONF_PROXY_UART_ID in config:
+        uart.final_validate_device_schema(
+            "comfoair ComfoSense proxy", uart_bus=CONF_PROXY_UART_ID, **uart_requirements
+        )(config)
+    return config
+
+
+FINAL_VALIDATE_SCHEMA = final_validate  # pylint: disable=invalid-name
+
 CONFIG_SCHEMA = cv.All(
     climate.climate_schema(ComfoAirComponent).extend(
         {
