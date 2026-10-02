@@ -1,0 +1,29 @@
+name: Host tests
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "components/**"
+      - "tests/**"
+  pull_request:
+    paths:
+      - "components/**"
+      - "tests/**"
+
+permissions:
+  contents: read
+
+jobs:
+  proxy:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - name: Proxy bus helper tests
+      run: |
+        g++ -std=c++17 -Wall -Wextra -I components/comfoair tests/proxy_bus_test.cpp -o /tmp/proxy_bus_test
+        /tmp/proxy_bus_test
+    - name: Proxy simulation
+      run: |
+        g++ -std=c++17 -Wall -Wextra -Wno-unused-parameter -I tests/sim -I components/comfoair tests/sim/proxy_sim.cpp -o /tmp/proxy_sim
+        /tmp/proxy_sim

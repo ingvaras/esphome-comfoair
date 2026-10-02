@@ -9,7 +9,7 @@ This component implements the legacy ComfoAir serial protocol.
 | Zehnder WHR 930, WHR 950 | Compatible | ComfoAir serial protocol |
 | Zehnder ComfoAir 160, 200, 500, 550 | Compatible | ComfoAir serial protocol |
 | Zehnder ComfoD 300, 350, 450, 550 | Compatible | ComfoAir serial protocol |
-| Legacy RS232 models with a connected ComfoSense panel | Use alternative fork | Sharing the connection with ComfoSense is not supported here; use [julianpas/esphome-comfoair](https://github.com/julianpas/esphome-comfoair) for dual-UART proxy support |
+| Legacy RS232 models with a connected ComfoSense panel | Compatible (proxy mode) | The ESP32 sits between unit and panel using two UARTs; see [ComfoSense proxy mode](#comfosense-proxy-mode) |
 | Zehnder ComfoAir G90-300 | Not compatible | RS485/ComfoControl Avignon protocol; see [gunzebe/zehnder-comfoair-ha](https://github.com/gunzebe/zehnder-comfoair-ha) for a Home Assistant/MQTT alternative with an RS485 mode |
 | Zehnder ComfoAir E300, E400 | Not compatible | Modbus RTU/TCP; use [remmob/comfoair](https://github.com/remmob/comfoair) for Home Assistant support |
 | Zehnder ComfoAir Q350, Q450, Q600 | Not compatible | CAN; not supported by this component |
@@ -23,6 +23,66 @@ RS485 adapter.
 For support with the E300 or E400, including RS485 adapters and gateways such
 as the Elfin EW-11, see the [remmob/comfoair Home Assistant
 integration](https://github.com/remmob/comfoair).
+
+## ComfoSense proxy mode
+
+A ComfoAir normally talks to its ComfoSense wall panel over a point-to-point
+RS232 link (9600 8N1). To use this component *and* keep the panel, put the
+ESP32 in the middle of that link with two UARTs (e.g. two MAX3232 level
+shifters) and cut the direct wire:
+
+```
+ComfoAir unit <--RS232--> MAX3232 <--> ESP32 <--> MAX3232 <--RS232--> ComfoSense
+                                  uart_id      proxy_uart_id
+```
+
+```
+uart:
+  - id: uart_unit          # to the ComfoAir unit
+    rx_pin: GPIO16
+    tx_pin: GPIO17
+    baud_rate: 9600
+    rx_buffer_size: 256
+  - id: uart_panel         # to the ComfoSense panel
+    rx_pin: GPIO18
+    tx_pin: GPIO19
+    baud_rate: 9600
+    rx_buffer_size: 256
+
+comfoair:
+  name: "ComfoAir 350"
+  uart_id: uart_unit
+  proxy_uart_id: uart_panel   # optional
+```
+
+`proxy_uart_id` is optional. Without it the component behaves exactly as
+before. With it:
+
+- **Pass-through:** every byte from the panel is forwarded to the unit and vice
+  versa, unchanged and immediately, so the panel keeps working as before. The
+  component enables ESPHome's high-frequency loop to keep the relay latency low.
+- **Sensors:** all traffic coming from the unit is run through the normal frame
+  parser, including the answers to the panel's own polls, so your sensors keep
+  updating. The component does not ACK relayed frames; the panel does that.
+- **Commands from Home Assistant** (and the component's own polls) are queued
+  and sent only when the bus is idle: both directions silent for 30 ms and no
+  panel request still waiting for the unit's answer. While such a frame is
+  being exchanged, the unit's reply is kept away from the panel and anything the
+  panel sends meanwhile is held back and replayed in order afterwards, so the
+  two conversations are never interleaved. A frame that gets no answer within
+  300 ms is retried once and then dropped. Set commands for the ventilation
+  level and comfort temperature replace an older queued one (latest wins).
+
+Trade-off: the panel may be delayed by up to roughly 300 ms (usually a few
+milliseconds) while a Home Assistant command is on the bus, and a command may
+wait if the panel is busy. The alternative of impersonating the panel towards
+the unit was rejected because it would need detailed knowledge of the panel's
+protocol and timers. A tiny collision window remains if the panel starts
+transmitting in the same few milliseconds that we start; the unit's checksum
+discards the damaged frame and the panel or the retry sends it again.
+
+Both UARTs must be 9600 8N1. Do not use the same UART for `uart_id` and
+`proxy_uart_id`.
 
 Port of the ComfoAir protocol to ESPHome.io firmware, which is supported by external_components.
 

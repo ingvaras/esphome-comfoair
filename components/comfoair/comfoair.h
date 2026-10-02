@@ -11,6 +11,7 @@
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/uart/uart.h"
 #include "esphome/core/component.h"
+#include "proxy_bus.h"
 #include "registers.h"
 
 #include <algorithm>
@@ -38,6 +39,7 @@ static const uint8_t MAX_MESSAGE_SIZE = 70U;
 // Reserve enough room for start/stop markers, command, length, and a
 // worst-case escaped checksum in addition to a fully escaped payload.
 static const uint8_t MAX_PROTOCOL_DATA_SIZE = (MAX_MESSAGE_SIZE - 9U) / 2U;
+static_assert(MAX_MESSAGE_SIZE == PROXY_MAX_FRAME_SIZE, "proxy_bus.h frame size must match MAX_MESSAGE_SIZE");
 
 static const char *TAG = "comfoair";
 
@@ -178,6 +180,19 @@ public:
       ESP_LOGCONFIG(TAG, "  CC-Luxe v%0d.%02d", *(p + 13) >> 4, *(p + 13) & 0x0f);
     }
     check_uart_settings(9600);
+    if (proxy_uart_ != nullptr)
+    {
+      ESP_LOGCONFIG(TAG, "  ComfoSense proxy: enabled (frames from Home Assistant wait for an idle bus)");
+    }
+  }
+
+  void setup() override
+  {
+    if (proxy_uart_ != nullptr)
+    {
+      // Relaying bytes between two UARTs needs a much faster loop than the default ~16ms.
+      high_freq_.start();
+    }
   }
 
   void update() override
@@ -269,6 +284,12 @@ public:
     // CA350
     // caRxSerial();       // receive ACKs and messages from CA350
 
+    if (proxy_uart_ != nullptr)
+    {
+      proxy_loop_();
+      return;
+    }
+
     while (available() != 0)
     {
       uint8_t rx_byte_u8;
@@ -276,31 +297,7 @@ public:
       // fetch byte for RX buffer and process it by readRx()
       read_byte(&rx_byte_u8);
 
-      switch (checkRx_(caRxBuffer_au8, &caRxIdx_u8, rx_byte_u8))
-      {
-      case RX_STATUS_DEFAULT:
-        break;
-      case RX_STATUS_RECEIVED_ACK:
-        ESP_LOGVV(TAG, "RX: ACK");
-        // caProcessNewACK(); // do something if an ACK is received
-        break;
-      case RX_STATUS_RECEIVED_MESSAGE:
-        ESP_LOGVV(TAG, "RX: message cmd: %02X", caRxBuffer_au8[1]);
-        // acknowledge message
-        txACK_();
-        // at this point caRxBuffer_au8 consists of
-        // 2-byte command, length, data and checksum.
-        // caProcessNewData(caRxBuffer); // do something with received message
-        parseRxMessage_(caRxBuffer_au8);
-        break;
-      case RX_STATUS_RECEIVED_INVALID_MESSAGE:
-        ESP_LOGW(TAG, "RX: Invalid checksum (from CA350).");
-        break;
-      case RX_STATUS_RECEIVED_START_OF_MESSAGE:
-      case RX_STATUS_WRAPPED_BUFFER_INDEX:
-      default:
-        break;
-      }
+      process_unit_rx_(checkRx_(caRxBuffer_au8, &caRxIdx_u8, rx_byte_u8), true);
     }
 
     // ComfoSense
@@ -324,6 +321,8 @@ public:
     name = value;
   }
   void set_uart_component(uart::UARTComponent *parent) { set_uart_parent(parent); }
+  // Optional second UART connected to the ComfoSense panel (proxy mode).
+  void set_proxy_uart(uart::UARTComponent *proxy_uart) { proxy_uart_ = proxy_uart; }
   bool set_unit_size(uint8_t raw_size);
   void set_size_select(ComfoAirSizeSelect *size_select);
 
@@ -331,6 +330,196 @@ public:
   void set_comfort_temperature(float temperature) { set_comfort_temperature_(temperature); }
 
 protected:
+  // Handle one result of checkRx_() for the stream coming from the unit.
+  // `ack_messages` is false in proxy mode for relayed frames: the panel
+  // acknowledges those itself.
+  void process_unit_rx_(rx_status status, bool ack_messages)
+  {
+    switch (status)
+    {
+    case RX_STATUS_DEFAULT:
+      break;
+    case RX_STATUS_RECEIVED_ACK:
+      ESP_LOGVV(TAG, "RX: ACK");
+      // caProcessNewACK(); // do something if an ACK is received
+      break;
+    case RX_STATUS_RECEIVED_MESSAGE:
+      ESP_LOGVV(TAG, "RX: message cmd: %02X", caRxBuffer_au8[1]);
+      // acknowledge message
+      if (ack_messages)
+      {
+        txACK_();
+      }
+      // at this point caRxBuffer_au8 consists of
+      // 2-byte command, length, data and checksum.
+      // caProcessNewData(caRxBuffer); // do something with received message
+      parseRxMessage_(caRxBuffer_au8);
+      break;
+    case RX_STATUS_RECEIVED_INVALID_MESSAGE:
+      ESP_LOGW(TAG, "RX: Invalid checksum (from CA350).");
+      break;
+    case RX_STATUS_RECEIVED_START_OF_MESSAGE:
+    case RX_STATUS_WRAPPED_BUFFER_INDEX:
+    default:
+      break;
+    }
+  }
+
+  // --- proxy mode (ComfoSense connected to a second UART) ---
+
+  // Commands that the unit answers with a bare ACK instead of a response frame.
+  static bool is_ack_only_command_(uint8_t command)
+  {
+    switch (command)
+    {
+    case CMD_SET_LEVEL:
+    case CMD_SET_ANALOG_VALUES:
+    case CMD_SET_TIME_DELAY:
+    case CMD_SET_VENTILATION_LEVEL:
+    case CMD_SET_COMFORT_TEMPERATURE:
+    case CMD_SET_STATUS:
+    case CMD_RESET_AND_SELF_TEST:
+    case CMD_SET_EWT_POSTHEATING:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  void proxy_loop_()
+  {
+    const uint32_t now = millis();
+    uint8_t byte_u8;
+    uint8_t relay_au8[MAX_MESSAGE_SIZE];
+    uint8_t relay_len_u8 = 0;
+
+    // Panel -> unit. Bytes are relayed untouched and immediately, unless we
+    // currently own the bus; then they are held back until our exchange ends.
+    while (proxy_uart_->available() != 0 && proxy_uart_->read_byte(&byte_u8))
+    {
+      arbiter_.note_panel_byte(millis());
+      // Track frames only to know when the bus is busy; the content is not used.
+      if (checkRx_(csRxBuffer_au8, &csRxIdx_u8, byte_u8) == RX_STATUS_RECEIVED_MESSAGE)
+      {
+        arbiter_.panel_frame_complete(millis());
+      }
+
+      if (arbiter_.own_exchange() || !hold_.empty())
+      {
+        if (!hold_.push(byte_u8))
+        {
+          ESP_LOGW(TAG, "Proxy: hold buffer full, dropping byte from ComfoSense");
+        }
+      }
+      else
+      {
+        relay_au8[relay_len_u8++] = byte_u8;
+        if (relay_len_u8 == sizeof(relay_au8))
+        {
+          write_array(relay_au8, relay_len_u8);
+          relay_len_u8 = 0;
+        }
+      }
+    }
+    if (relay_len_u8 != 0)
+    {
+      write_array(relay_au8, relay_len_u8);
+      relay_len_u8 = 0;
+    }
+
+    // Unit -> panel. Everything is parsed. While we own the bus the unit is
+    // talking to us, so nothing is relayed to the panel.
+    while (available() != 0 && read_byte(&byte_u8))
+    {
+      arbiter_.note_unit_byte(millis());
+      const bool own = arbiter_.own_exchange();
+      if (!own)
+      {
+        relay_au8[relay_len_u8++] = byte_u8;
+        if (relay_len_u8 == sizeof(relay_au8))
+        {
+          proxy_uart_->write_array(relay_au8, relay_len_u8);
+          relay_len_u8 = 0;
+        }
+      }
+
+      const rx_status status = checkRx_(caRxBuffer_au8, &caRxIdx_u8, byte_u8);
+      process_unit_rx_(status, own);
+      if (status == RX_STATUS_RECEIVED_MESSAGE)
+      {
+        arbiter_.unit_frame_complete();
+      }
+      if (own && ((status == RX_STATUS_RECEIVED_MESSAGE && inflight_expects_response_) ||
+                  (status == RX_STATUS_RECEIVED_ACK && !inflight_expects_response_)))
+      {
+        finish_own_exchange_(now, true);
+      }
+    }
+    if (relay_len_u8 != 0)
+    {
+      proxy_uart_->write_array(relay_au8, relay_len_u8);
+    }
+
+    if (arbiter_.own_exchange_timed_out(now))
+    {
+      finish_own_exchange_(now, false);
+    }
+
+    // Inject our own frame when the bus is idle.
+    if (!arbiter_.own_exchange() && hold_.empty() && arbiter_.can_inject(now))
+    {
+      start_own_exchange_(now);
+    }
+  }
+
+  void start_own_exchange_(uint32_t now)
+  {
+    if (!retry_pending_)
+    {
+      if (!tx_queue_.pop(&inflight_))
+      {
+        return;
+      }
+      inflight_attempts_ = 0;
+    }
+    retry_pending_ = false;
+    inflight_attempts_++;
+    inflight_expects_response_ = !is_ack_only_command_(inflight_.command());
+
+    // The unit's reply must not be mistaken for a half-finished relayed frame.
+    caRxIdx_u8 = 0;
+    arbiter_.begin_own_exchange(now);
+    ESP_LOGVV(TAG, "Proxy: injecting cmd %02X", inflight_.command());
+    write_array(inflight_.data, inflight_.length);
+    flush();
+  }
+
+  void finish_own_exchange_(uint32_t now, bool success)
+  {
+    arbiter_.end_own_exchange();
+    caRxIdx_u8 = 0;
+    if (!success)
+    {
+      if (inflight_attempts_ < 2)
+      {
+        ESP_LOGD(TAG, "Proxy: no answer to cmd %02X, retrying", inflight_.command());
+        retry_pending_ = true;
+      }
+      else
+      {
+        ESP_LOGW(TAG, "Proxy: no answer to cmd %02X, giving up", inflight_.command());
+      }
+    }
+
+    // Replay what the panel sent while we were busy.
+    if (!hold_.empty())
+    {
+      write_array(hold_.data(), hold_.length());
+      hold_.clear();
+      arbiter_.note_panel_byte(now);
+    }
+  }
+
   // --- setter ---
 
   void reset_errors_(bool filters, bool errors)
@@ -501,6 +690,17 @@ protected:
     //   break;
     // }
     idx_txBuffer_u8++;
+    if (proxy_uart_ != nullptr)
+    {
+      // The bus is shared with the ComfoSense panel; wait for an idle gap.
+      const uint8_t command = txBuffer_au8[3];
+      const bool latest_wins = command == CMD_SET_LEVEL || command == CMD_SET_COMFORT_TEMPERATURE;
+      if (!tx_queue_.push(txBuffer_au8, idx_txBuffer_u8, latest_wins))
+      {
+        ESP_LOGW(TAG, "Proxy: TX queue full, dropping cmd %02X", command);
+      }
+      return;
+    }
     write_array(txBuffer_au8, idx_txBuffer_u8);
     flush();
   }
@@ -1356,6 +1556,20 @@ protected:
 
   uint8_t caRxBuffer_au8[MAX_MESSAGE_SIZE]{};
   uint8_t caRxIdx_u8 = 0;
+
+  // Proxy mode state (unused when no proxy UART is configured).
+  uart::UARTComponent *proxy_uart_{nullptr};
+  uint8_t csRxBuffer_au8[MAX_MESSAGE_SIZE]{};
+  uint8_t csRxIdx_u8 = 0;
+  ProxyBusArbiter arbiter_;
+  ProxyTxQueue tx_queue_;
+  ProxyHoldBuffer hold_;
+  ProxyTxQueue::Frame inflight_;
+  uint8_t inflight_attempts_{0};
+  bool inflight_expects_response_{false};
+  bool retry_pending_{false};
+  HighFrequencyLoopRequester high_freq_;
+
   int8_t update_counter_{-10};
   uint8_t status_payload_[8]{0};
   bool status_payload_valid_{false};
