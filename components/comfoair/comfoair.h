@@ -388,7 +388,9 @@ protected:
     {
       return;
     }
-    ESP_LOGI(TAG, "RAW %s: %s", direction, format_hex_pretty(collector.data(), collector.length()).c_str());
+    char hex[RawByteCollector::CAPACITY * 3];
+    format_hex_pretty_to(hex, collector.data(), collector.length(), ' ');
+    ESP_LOGI(TAG, "RAW %s: %s", direction, hex);
     collector.clear();
   }
 

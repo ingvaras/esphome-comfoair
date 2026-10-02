@@ -20,7 +20,11 @@
 namespace esphome
 {
 uint32_t millis(); // provided by the simulation
-inline std::string format_hex_pretty(const uint8_t *, size_t) { return ""; }
+template <size_t N> inline char *format_hex_pretty_to(char (&buffer)[N], const uint8_t *, size_t, char = ':')
+{
+  buffer[0] = 0;
+  return buffer;
+}
 
 class Component
 {
