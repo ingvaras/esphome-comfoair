@@ -198,5 +198,32 @@ private:
   uint16_t length_{0};
 };
 
+// Collects raw bytes of one direction so they can be logged as one hex line
+// per burst. Used for the optional log_raw_bytes debugging aid.
+class RawByteCollector
+{
+public:
+  static const uint8_t CAPACITY = 32U;
+  static const uint32_t BURST_GAP_MS = 5U;
+
+  // Returns true if the buffer is full and must be flushed.
+  bool add(uint8_t byte, uint32_t now_ms)
+  {
+    data_[length_++] = byte;
+    last_byte_ms_ = now_ms;
+    return length_ == CAPACITY;
+  }
+
+  bool should_flush(uint32_t now_ms) const { return length_ != 0 && (now_ms - last_byte_ms_) >= BURST_GAP_MS; }
+  const uint8_t *data() const { return data_; }
+  uint8_t length() const { return length_; }
+  void clear() { length_ = 0; }
+
+private:
+  uint8_t data_[CAPACITY];
+  uint8_t length_{0};
+  uint32_t last_byte_ms_{0};
+};
+
 } // namespace comfoair
 } // namespace esphome

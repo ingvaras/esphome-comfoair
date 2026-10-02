@@ -295,9 +295,11 @@ public:
 
       // fetch byte for RX buffer and process it by readRx()
       read_byte(&rx_byte_u8);
+      log_raw_byte_(unit_raw_, "unit", rx_byte_u8);
 
       process_unit_rx_(checkRx_(caRxBuffer_au8, &caRxIdx_u8, rx_byte_u8), true);
     }
+    flush_raw_logs_();
 
     // ComfoSense
     // csRxSerial();       // receive ACKs and messages from ComfoSense
@@ -322,6 +324,8 @@ public:
   void set_uart_component(uart::UARTComponent *parent) { set_uart_parent(parent); }
   // Optional second UART connected to the ComfoSense panel (proxy mode).
   void set_proxy_uart(uart::UARTComponent *proxy_uart) { proxy_uart_ = proxy_uart; }
+  // Log every byte received from the unit (and the panel) as hex, for protocol debugging.
+  void set_log_raw_bytes(bool log_raw_bytes) { log_raw_bytes_ = log_raw_bytes; }
   bool set_unit_size(uint8_t raw_size);
   void set_size_select(ComfoAirSizeSelect *size_select);
 
@@ -364,6 +368,47 @@ protected:
     }
   }
 
+  // --- raw byte logging (log_raw_bytes: true) ---
+
+  void log_raw_byte_(RawByteCollector &collector, const char *direction, uint8_t byte)
+  {
+    if (!log_raw_bytes_)
+    {
+      return;
+    }
+    if (collector.add(byte, millis()))
+    {
+      flush_raw_(collector, direction);
+    }
+  }
+
+  void flush_raw_(RawByteCollector &collector, const char *direction)
+  {
+    if (collector.length() == 0)
+    {
+      return;
+    }
+    ESP_LOGI(TAG, "RAW %s: %s", direction, format_hex_pretty(collector.data(), collector.length()).c_str());
+    collector.clear();
+  }
+
+  void flush_raw_logs_()
+  {
+    if (!log_raw_bytes_)
+    {
+      return;
+    }
+    const uint32_t now = millis();
+    if (unit_raw_.should_flush(now))
+    {
+      flush_raw_(unit_raw_, proxy_uart_ != nullptr ? "unit->panel" : "unit");
+    }
+    if (panel_raw_.should_flush(now))
+    {
+      flush_raw_(panel_raw_, "panel->unit");
+    }
+  }
+
   // --- proxy mode (ComfoSense connected to a second UART) ---
 
   // Commands that the unit answers with a bare ACK instead of a response frame.
@@ -397,6 +442,7 @@ protected:
     while (proxy_uart_->available() != 0 && proxy_uart_->read_byte(&byte_u8))
     {
       arbiter_.note_panel_byte(millis());
+      log_raw_byte_(panel_raw_, "panel->unit", byte_u8);
       // Track frames only to know when the bus is busy; the content is not used.
       if (checkRx_(csRxBuffer_au8, &csRxIdx_u8, byte_u8) == RX_STATUS_RECEIVED_MESSAGE)
       {
@@ -431,6 +477,7 @@ protected:
     while (available() != 0 && read_byte(&byte_u8))
     {
       arbiter_.note_unit_byte(millis());
+      log_raw_byte_(unit_raw_, "unit->panel", byte_u8);
       const bool own = arbiter_.own_exchange();
       if (!own)
       {
@@ -458,6 +505,8 @@ protected:
     {
       proxy_uart_->write_array(relay_au8, relay_len_u8);
     }
+
+    flush_raw_logs_();
 
     if (arbiter_.own_exchange_timed_out(now))
     {
@@ -1568,6 +1617,9 @@ protected:
   bool inflight_expects_response_{false};
   bool retry_pending_{false};
   HighFrequencyLoopRequester high_freq_;
+  bool log_raw_bytes_{false};
+  RawByteCollector unit_raw_;
+  RawByteCollector panel_raw_;
 
   int8_t update_counter_{-10};
   uint8_t status_payload_[8]{0};
