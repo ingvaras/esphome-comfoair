@@ -451,7 +451,7 @@ protected:
       if (checkRx_(csRxBuffer_au8, &csRxIdx_u8, byte_u8) == RX_STATUS_RECEIVED_MESSAGE)
       {
         arbiter_.panel_frame_complete(millis());
-        if (test_fake_unit_reply_ && !arbiter_.own_exchange())
+        if (test_fake_unit_reply_)
         {
           send_fake_unit_reply_(csRxBuffer_au8[1]);
         }
