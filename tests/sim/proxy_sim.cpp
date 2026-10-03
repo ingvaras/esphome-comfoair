@@ -239,6 +239,27 @@ static void test_panel_frame()
   CHECK(off.panel.tx.empty());
 }
 
+// test_ack_panel_frames acknowledges each valid panel frame, but not the panel's own ACKs.
+static void test_ack_panel_frames()
+{
+  Rig r(true);
+  r.c.set_test_ack_panel_frames(true);
+  Bytes req = frame(CMD_GET_FAN_STATUS, {});
+  r.panel.feed(req);
+  r.run(10);
+  CHECK(r.panel.tx == ACK);   // acknowledged once
+  CHECK(r.unit.tx == req);    // and still relayed unchanged
+
+  r.panel.feed(ACK);          // the panel's own ACK is not acknowledged
+  r.run(10);
+  CHECK(r.panel.tx == ACK);
+
+  Rig off(true); // disabled by default
+  off.panel.feed(req);
+  off.run(10);
+  CHECK(off.panel.tx.empty());
+}
+
 int main()
 {
   test_transparent_relay();
@@ -247,6 +268,7 @@ int main()
   test_legacy_mode();
   test_fake_unit_reply();
   test_panel_frame();
+  test_ack_panel_frames();
   std::printf("all proxy simulation tests passed\n");
   return 0;
 }

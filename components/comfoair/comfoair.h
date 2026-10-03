@@ -332,6 +332,8 @@ public:
   void set_test_fake_unit_reply(bool value) { test_fake_unit_reply_ = value; }
   // Test aid: periodically send the panel a frame that it should acknowledge (proxy mode only).
   void set_test_panel_frame(bool value) { test_panel_frame_ = value; }
+  // Test aid: acknowledge every valid frame from the panel ourselves (proxy mode only).
+  void set_test_ack_panel_frames(bool value) { test_ack_panel_frames_ = value; }
   bool set_unit_size(uint8_t raw_size);
   void set_size_select(ComfoAirSizeSelect *size_select);
 
@@ -455,6 +457,13 @@ protected:
       if (checkRx_(csRxBuffer_au8, &csRxIdx_u8, byte_u8) == RX_STATUS_RECEIVED_MESSAGE)
       {
         arbiter_.panel_frame_complete(millis());
+        if (test_ack_panel_frames_)
+        {
+          // Acknowledge the frame ourselves, as the unit would. A panel that receives this
+          // stops resending the frame.
+          proxy_uart_->write_byte(COMMAND_PREFIX);
+          proxy_uart_->write_byte(COMMAND_HEAD_ACK);
+        }
         if (test_fake_unit_reply_)
         {
           send_fake_unit_reply_(csRxBuffer_au8[1]);
@@ -1653,6 +1662,7 @@ protected:
   bool log_raw_bytes_{false};
   bool test_fake_unit_reply_{false};
   bool test_panel_frame_{false};
+  bool test_ack_panel_frames_{false};
   uint32_t last_test_panel_frame_ms_{0};
   RawByteCollector unit_raw_;
   RawByteCollector panel_raw_;
