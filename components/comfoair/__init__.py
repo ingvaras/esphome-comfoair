@@ -55,6 +55,7 @@ CONF_HUB_ID = "comfoair"
 CONF_PROXY_UART_ID = "proxy_uart_id"
 CONF_LOG_RAW_BYTES = "log_raw_bytes"
 CONF_TEST_FAKE_UNIT_REPLY = "test_fake_unit_reply"
+CONF_TEST_PANEL_FRAME = "test_panel_frame"
 
 UNIT_WEEK = "weeks"
 
@@ -718,6 +719,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_PROXY_UART_ID): cv.use_id(uart.UARTComponent),
             cv.Optional(CONF_LOG_RAW_BYTES, default=False): cv.boolean,
             cv.Optional(CONF_TEST_FAKE_UNIT_REPLY, default=False): cv.boolean,
+            cv.Optional(CONF_TEST_PANEL_FRAME, default=False): cv.boolean,
         }
     )
     .extend(uart.UART_DEVICE_SCHEMA)
@@ -736,6 +738,7 @@ def to_code(config):
     cg.add(var.set_uart_component(paren))
     cg.add(var.set_log_raw_bytes(config[CONF_LOG_RAW_BYTES]))
     cg.add(var.set_test_fake_unit_reply(config[CONF_TEST_FAKE_UNIT_REPLY]))
+    cg.add(var.set_test_panel_frame(config[CONF_TEST_PANEL_FRAME]))
     if CONF_PROXY_UART_ID in config:
         proxy_paren = yield cg.get_variable(config[CONF_PROXY_UART_ID])
         cg.add(var.set_proxy_uart(proxy_paren))

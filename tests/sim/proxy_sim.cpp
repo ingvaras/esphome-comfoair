@@ -215,6 +215,30 @@ static void test_fake_unit_reply()
   CHECK(off.panel.tx.empty());
 }
 
+// test_panel_frame periodically sends the panel a clock frame; the panel's ACK is relayed as usual.
+static void test_panel_frame()
+{
+  Rig r(true);
+  r.c.set_test_panel_frame(true);
+  r.run(100);
+  CHECK(r.panel.tx.empty()); // not before the first interval
+
+  r.run(2000);
+  Bytes expected = frame(CMD_SET_PARAMETER, {0x02, 12, 34, 30, 100});
+  CHECK(r.panel.tx == expected);
+
+  r.panel.feed(ACK); // the panel's answer goes on to the unit unchanged
+  r.run(10);
+  CHECK(r.unit.tx == ACK);
+
+  r.run(2000);
+  CHECK(r.panel.tx == concat(expected, expected)); // repeats every interval
+
+  Rig off(true); // disabled by default
+  off.run(5000);
+  CHECK(off.panel.tx.empty());
+}
+
 int main()
 {
   test_transparent_relay();
@@ -222,6 +246,7 @@ int main()
   test_timeout_retry();
   test_legacy_mode();
   test_fake_unit_reply();
+  test_panel_frame();
   std::printf("all proxy simulation tests passed\n");
   return 0;
 }

@@ -32,6 +32,7 @@ typedef enum
   RX_STATUS_WRAPPED_BUFFER_INDEX       // wrapped buffer index (just 4 info. no error.)
 } rx_status;
 
+static const uint32_t TEST_PANEL_FRAME_INTERVAL_MS = 2000U;
 static const uint8_t COMFOAIR_MIN_SUPPORTED_TEMP = 12;
 static const uint8_t COMFOAIR_MAX_SUPPORTED_TEMP = 29;
 static const float COMFOAIR_SUPPORTED_TEMP_STEP = 0.5f;
@@ -187,6 +188,7 @@ public:
 
   void setup() override
   {
+    last_test_panel_frame_ms_ = millis();
     if (proxy_uart_ != nullptr)
     {
       // Relaying bytes between two UARTs needs a much faster loop than the default ~16ms.
@@ -328,6 +330,8 @@ public:
   void set_log_raw_bytes(bool log_raw_bytes) { log_raw_bytes_ = log_raw_bytes; }
   // Test aid: answer the panel's temperature poll with fake values (proxy mode only).
   void set_test_fake_unit_reply(bool value) { test_fake_unit_reply_ = value; }
+  // Test aid: periodically send the panel a frame that it should acknowledge (proxy mode only).
+  void set_test_panel_frame(bool value) { test_panel_frame_ = value; }
   bool set_unit_size(uint8_t raw_size);
   void set_size_select(ComfoAirSizeSelect *size_select);
 
@@ -516,6 +520,12 @@ protected:
 
     flush_raw_logs_();
 
+    if (test_panel_frame_ && (now - last_test_panel_frame_ms_) >= TEST_PANEL_FRAME_INTERVAL_MS)
+    {
+      last_test_panel_frame_ms_ = now;
+      send_test_panel_frame_();
+    }
+
     if (arbiter_.own_exchange_timed_out(now))
     {
       finish_own_exchange_(now, false);
@@ -551,6 +561,24 @@ protected:
     proxy_uart_->write_array(frame_au8, frame_len);
     proxy_uart_->flush();
     ESP_LOGI(TAG, "Test: answered ComfoSense temperature request with fake values");
+  }
+
+  // Hardware test aid (test_panel_frame: true): send the panel a frame a real unit sends it
+  // (clock and backlight parameters, Monday 12:34). A panel that receives it acknowledges with
+  // 07 F3, which shows up as "RAW panel->unit: 07 F3" when log_raw_bytes is enabled.
+  void send_test_panel_frame_()
+  {
+    uint8_t message_au8[MAX_MESSAGE_SIZE]{};
+    message_au8[1] = CMD_SET_PARAMETER;
+    message_au8[2] = 5;
+    const uint8_t data[5] = {0x02, 12, 34, 30, 100};
+    memcpy(&message_au8[3], data, sizeof(data));
+
+    uint8_t frame_au8[MAX_MESSAGE_SIZE];
+    const uint8_t frame_len = encodeMessage_(message_au8, frame_au8);
+    proxy_uart_->write_array(frame_au8, frame_len);
+    proxy_uart_->flush();
+    ESP_LOGI(TAG, "Test: sent clock frame to ComfoSense, expecting an ACK (07 F3) from the panel");
   }
 
   void start_own_exchange_(uint32_t now)
@@ -1624,6 +1652,8 @@ protected:
   HighFrequencyLoopRequester high_freq_;
   bool log_raw_bytes_{false};
   bool test_fake_unit_reply_{false};
+  bool test_panel_frame_{false};
+  uint32_t last_test_panel_frame_ms_{0};
   RawByteCollector unit_raw_;
   RawByteCollector panel_raw_;
 
