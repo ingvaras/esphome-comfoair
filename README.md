@@ -84,6 +84,18 @@ discards the damaged frame and the panel or the retry sends it again.
 Both UARTs must be 9600 8N1. Do not use the same UART for `uart_id` and
 `proxy_uart_id`.
 
+**Wiring check (ESP32):** if the unit or the panel has sent nothing 30 seconds
+after boot, the component tests its four UART pins once, for about a minute, and
+then resumes normal operation. Nothing happens while both sides are talking. It
+logs whether each adapter's RX and TX are the right way round on the ESP side,
+what it heard on each pin, and which pin combination the unit and panel answer
+on. The result is repeated at the top of the log on every new log connection.
+If RX and TX are swapped on the ESP side, swap `rx_pin` and `tx_pin` in the YAML;
+no rewiring is needed. If the ESP side is fine but nothing answers, look at the
+RS232 side, because software can't tell crossed wires from a device that is
+disconnected or has no power. The check sends the panel's clock frame (Monday
+12:34) and a fan status request. Set `wiring_check: false` to disable it.
+
 Port of the ComfoAir protocol to ESPHome.io firmware, which is supported by external_components.
 
 The component sends one protocol request every two seconds. After the initial

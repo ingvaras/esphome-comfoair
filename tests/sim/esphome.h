@@ -9,20 +9,59 @@
 #include <string>
 #include <vector>
 
-#define ESP_LOGCONFIG(...) ((void)0)
-#define ESP_LOGE(...) ((void)0)
-#define ESP_LOGW(...) ((void)0)
-#define ESP_LOGI(...) ((void)0)
-#define ESP_LOGD(...) ((void)0)
-#define ESP_LOGV(...) ((void)0)
-#define ESP_LOGVV(...) ((void)0)
+// The ESP32-only code of comfoair.h runs against the driver stand-ins below.
+#define USE_ESP32
+
+// Build with -DSIM_PRINT_LOGS to see the component's log output.
+template <typename... Args> inline void sim_log(const char *level, const char *tag, const char *format, Args... args)
+{
+#ifdef SIM_PRINT_LOGS
+  std::printf("[%s][%s] ", level, tag);
+  std::printf(format, args...);
+  std::printf("\n");
+#endif
+}
+#define ESP_LOGCONFIG(...) sim_log("C", __VA_ARGS__)
+#define ESP_LOGE(...) sim_log("E", __VA_ARGS__)
+#define ESP_LOGW(...) sim_log("W", __VA_ARGS__)
+#define ESP_LOGI(...) sim_log("I", __VA_ARGS__)
+#define ESP_LOGD(...) sim_log("D", __VA_ARGS__)
+#define ESP_LOGV(...) sim_log("V", __VA_ARGS__)
+#define ESP_LOGVV(...) sim_log("VV", __VA_ARGS__)
+
+// driver/gpio.h and driver/uart.h, provided by the simulation.
+typedef int gpio_num_t;
+typedef int uart_port_t;
+enum gpio_mode_t
+{
+  GPIO_MODE_INPUT
+};
+enum gpio_pull_mode_t
+{
+  GPIO_PULLUP_ONLY,
+  GPIO_PULLDOWN_ONLY
+};
+#define UART_PIN_NO_CHANGE (-1)
+void gpio_reset_pin(gpio_num_t pin);
+void gpio_set_direction(gpio_num_t pin, gpio_mode_t mode);
+void gpio_set_pull_mode(gpio_num_t pin, gpio_pull_mode_t pull);
+int gpio_get_level(gpio_num_t pin);
+void uart_set_pin(uart_port_t port, int tx, int rx, int rts, int cts);
+void uart_flush_input(uart_port_t port);
 
 namespace esphome
 {
 uint32_t millis(); // provided by the simulation
-template <size_t N> inline char *format_hex_pretty_to(char (&buffer)[N], const uint8_t *, size_t, char = ':')
+inline void delay(uint32_t) {}
+template <size_t N>
+inline char *format_hex_pretty_to(char (&buffer)[N], const uint8_t *data, size_t length, char separator = ':')
 {
+  size_t used = 0;
   buffer[0] = 0;
+  for (size_t i = 0; i < length && used + 4 <= N; i++)
+  {
+    used += std::snprintf(buffer + used, N - used, "%s%02X", i == 0 ? "" : std::string(1, separator).c_str(), data[i]);
+  }
   return buffer;
 }
 
@@ -66,7 +105,15 @@ public:
   virtual size_t available() = 0;
   virtual bool read_byte(uint8_t *data) = 0;
   virtual void flush() = 0;
+  virtual void load_settings(bool) {}
   void write_byte(uint8_t b) { write_array(&b, 1); }
+};
+
+class IDFUARTComponent : public UARTComponent
+{
+public:
+  uint8_t get_hw_serial_number() { return port; }
+  uint8_t port{0};
 };
 
 class UARTDevice

@@ -16,6 +16,12 @@
 
 #include <algorithm>
 
+#ifdef USE_ESP32
+#include <driver/gpio.h>
+#include <driver/uart.h>
+#include "esphome/components/uart/uart_component_esp_idf.h"
+#endif
+
 namespace esphome
 {
 namespace comfoair
@@ -33,6 +39,10 @@ typedef enum
 } rx_status;
 
 static const uint32_t TEST_PANEL_FRAME_INTERVAL_MS = 2000U;
+// The wiring check starts if the unit or panel is still silent this long after boot.
+static const uint32_t WIRING_CHECK_DELAY_MS = 30000U;
+static const uint32_t WIRING_CHECK_TICK_MS = 1000U;
+static const int WIRING_CHECK_LISTEN_TICKS = 15;
 static const uint8_t COMFOAIR_MIN_SUPPORTED_TEMP = 12;
 static const uint8_t COMFOAIR_MAX_SUPPORTED_TEMP = 29;
 static const float COMFOAIR_SUPPORTED_TEMP_STEP = 0.5f;
@@ -184,11 +194,22 @@ public:
     {
       ESP_LOGCONFIG(TAG, "  ComfoSense proxy: enabled (frames from Home Assistant wait for an idle bus)");
     }
+#ifdef USE_ESP32
+    if (wiring_check_running_)
+    {
+      ESP_LOGCONFIG(TAG, "  Wiring check: running, the result follows in about a minute");
+    }
+    if (wiring_check_done_)
+    {
+      log_wiring_check_result_();
+    }
+#endif
   }
 
   void setup() override
   {
-    last_test_panel_frame_ms_ = millis();
+    boot_ms_ = millis();
+    last_test_panel_frame_ms_ = boot_ms_;
     if (proxy_uart_ != nullptr)
     {
       // Relaying bytes between two UARTs needs a much faster loop than the default ~16ms.
@@ -198,6 +219,10 @@ public:
 
   void update() override
   {
+    if (wiring_check_running_)
+    {
+      return;
+    }
     ESP_LOGD(TAG, "Component update: %d", update_counter_);
     switch (update_counter_)
     {
@@ -287,6 +312,12 @@ public:
 
     if (proxy_uart_ != nullptr)
     {
+#ifdef USE_ESP32
+      if (wiring_check_loop_())
+      {
+        return;
+      }
+#endif
       proxy_loop_();
       return;
     }
@@ -334,6 +365,18 @@ public:
   void set_test_panel_frame(bool value) { test_panel_frame_ = value; }
   // Test aid: acknowledge every valid frame from the panel ourselves (proxy mode only).
   void set_test_ack_panel_frames(bool value) { test_ack_panel_frames_ = value; }
+  // Enable the automatic wiring check (proxy mode on ESP32), with the GPIO numbers as configured.
+  void set_wiring_check_pins(uint8_t unit_rx, uint8_t unit_tx, uint8_t panel_rx, uint8_t panel_tx)
+  {
+    wiring_check_pins_[0] = unit_rx;
+    wiring_check_pins_[1] = unit_tx;
+    wiring_check_pins_[2] = panel_rx;
+    wiring_check_pins_[3] = panel_tx;
+    wiring_check_pending_ = true;
+  }
+  const WiringCheck &wiring_check() const { return wiring_check_; }
+  bool wiring_check_running() const { return wiring_check_running_; }
+  bool wiring_check_done() const { return wiring_check_done_; }
   bool set_unit_size(uint8_t raw_size);
   void set_size_select(ComfoAirSizeSelect *size_select);
 
@@ -577,17 +620,21 @@ protected:
   // 07 F3, which shows up as "RAW panel->unit: 07 F3" when log_raw_bytes is enabled.
   void send_test_panel_frame_()
   {
+    uint8_t frame_au8[MAX_MESSAGE_SIZE];
+    const uint8_t frame_len = encode_panel_clock_frame_(frame_au8);
+    proxy_uart_->write_array(frame_au8, frame_len);
+    proxy_uart_->flush();
+    ESP_LOGI(TAG, "Test: sent clock frame to ComfoSense, expecting an ACK (07 F3) from the panel");
+  }
+
+  uint8_t encode_panel_clock_frame_(uint8_t frame_au8[])
+  {
     uint8_t message_au8[MAX_MESSAGE_SIZE]{};
     message_au8[1] = CMD_SET_PARAMETER;
     message_au8[2] = 5;
     const uint8_t data[5] = {0x02, 12, 34, 30, 100};
     memcpy(&message_au8[3], data, sizeof(data));
-
-    uint8_t frame_au8[MAX_MESSAGE_SIZE];
-    const uint8_t frame_len = encodeMessage_(message_au8, frame_au8);
-    proxy_uart_->write_array(frame_au8, frame_len);
-    proxy_uart_->flush();
-    ESP_LOGI(TAG, "Test: sent clock frame to ComfoSense, expecting an ACK (07 F3) from the panel");
+    return encodeMessage_(message_au8, frame_au8);
   }
 
   void start_own_exchange_(uint32_t now)
@@ -637,6 +684,265 @@ protected:
       arbiter_.note_panel_byte(now);
     }
   }
+
+#ifdef USE_ESP32
+  // --- wiring check (proxy mode on ESP32, wiring_check: true) ---
+
+  // Runs once per boot if the unit or panel stays silent. Takes over both UARTs while it
+  // runs, then restores them. Returns true while it owns the UARTs.
+  bool wiring_check_loop_()
+  {
+    const uint32_t now = millis();
+    if (!wiring_check_running_)
+    {
+      const bool links_seen = arbiter_.unit_seen() && arbiter_.panel_seen();
+      if (!wiring_check_pending_ || links_seen || (now - boot_ms_) < WIRING_CHECK_DELAY_MS ||
+          arbiter_.own_exchange() || !hold_.empty())
+      {
+        return false;
+      }
+      ESP_LOGW(TAG, "Wiring check: no data from the %s, testing the pins for about a minute",
+               arbiter_.unit_seen() ? "panel" : (arbiter_.panel_seen() ? "unit" : "unit or panel"));
+      wiring_check_pending_ = false;
+      wiring_check_running_ = true;
+      wiring_check_tick_ = 0;
+      wiring_check_tick_ms_ = now - WIRING_CHECK_TICK_MS;
+    }
+    if ((now - wiring_check_tick_ms_) >= WIRING_CHECK_TICK_MS)
+    {
+      wiring_check_tick_ms_ = now;
+      wiring_check_step_();
+    }
+    return wiring_check_running_;
+  }
+
+  void wiring_check_step_()
+  {
+    const int tick = wiring_check_tick_++;
+    if (tick == 0)
+    {
+      wiring_check_measure_pins_();
+      wiring_check_listen_(0, 2);
+    }
+    else if (tick <= WIRING_CHECK_LISTEN_TICKS)
+    {
+      wiring_check_drain_(0, 2);
+      if (tick == WIRING_CHECK_LISTEN_TICKS)
+      {
+        wiring_check_listen_(1, 3);
+      }
+    }
+    else if (tick <= 2 * WIRING_CHECK_LISTEN_TICKS)
+    {
+      wiring_check_drain_(1, 3);
+      if (tick == 2 * WIRING_CHECK_LISTEN_TICKS)
+      {
+        wiring_check_.plan_tests();
+      }
+    }
+    else
+    {
+      // Each pin combination takes four ticks: send, read, send, read.
+      const int step = tick - 2 * WIRING_CHECK_LISTEN_TICKS - 1;
+      if (step / 4 >= wiring_check_.test_count())
+      {
+        wiring_check_finish_();
+      }
+      else
+      {
+        wiring_check_test_step_(step / 4, step % 4);
+      }
+    }
+  }
+
+  static uart_port_t wiring_check_port_(uart::UARTComponent *uart)
+  {
+    return static_cast<uart_port_t>(static_cast<uart::IDFUARTComponent *>(uart)->get_hw_serial_number());
+  }
+
+  gpio_num_t wiring_check_gpio_(uint8_t pin) const { return static_cast<gpio_num_t>(wiring_check_pins_[pin]); }
+
+  static uint8_t wiring_check_count_high_(gpio_num_t pin)
+  {
+    uint8_t high_u8 = 0;
+    delay(1);
+    for (uint8_t i = 0; i < WiringCheck::SAMPLES_PER_PULL; i++)
+    {
+      high_u8 += gpio_get_level(pin) != 0 ? 1 : 0;
+      delay(1);
+    }
+    return high_u8;
+  }
+
+  void wiring_check_release_pin_(uint8_t pin)
+  {
+    const gpio_num_t gpio = wiring_check_gpio_(pin);
+    gpio_reset_pin(gpio);
+    gpio_set_direction(gpio, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(gpio, GPIO_PULLUP_ONLY);
+  }
+
+  void wiring_check_measure_pins_()
+  {
+    for (uint8_t pin = 0; pin < WiringCheck::PIN_COUNT; pin++)
+    {
+      const gpio_num_t gpio = wiring_check_gpio_(pin);
+      wiring_check_release_pin_(pin);
+      const uint8_t high_with_pullup = wiring_check_count_high_(gpio);
+      gpio_set_pull_mode(gpio, GPIO_PULLDOWN_ONLY);
+      const uint8_t high_with_pulldown = wiring_check_count_high_(gpio);
+      gpio_set_pull_mode(gpio, GPIO_PULLUP_ONLY);
+      wiring_check_.set_drive(pin, WiringCheck::classify_pin(high_with_pullup, high_with_pulldown));
+    }
+  }
+
+  void wiring_check_listen_(uint8_t unit_uart_pin, uint8_t panel_uart_pin)
+  {
+    const uart_port_t unit_port = wiring_check_port_(parent_);
+    const uart_port_t panel_port = wiring_check_port_(proxy_uart_);
+    uart_set_pin(unit_port, UART_PIN_NO_CHANGE, wiring_check_gpio_(unit_uart_pin), UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_set_pin(panel_port, UART_PIN_NO_CHANGE, wiring_check_gpio_(panel_uart_pin), UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_flush_input(unit_port);
+    uart_flush_input(panel_port);
+  }
+
+  void wiring_check_drain_(uint8_t unit_uart_pin, uint8_t panel_uart_pin)
+  {
+    uint8_t byte_u8;
+    while (available() != 0 && read_byte(&byte_u8))
+    {
+      wiring_check_.note_heard(unit_uart_pin, byte_u8);
+    }
+    while (proxy_uart_->available() != 0 && proxy_uart_->read_byte(&byte_u8))
+    {
+      wiring_check_.note_heard(panel_uart_pin, byte_u8);
+    }
+  }
+
+  void wiring_check_test_step_(uint8_t test, int step)
+  {
+    const uart_port_t port = wiring_check_port_(parent_);
+    const uint8_t tx = wiring_check_.test_tx(test);
+    const uint8_t rx = wiring_check_.test_rx(test);
+    uint8_t frame_au8[MAX_MESSAGE_SIZE];
+
+    if (step == 0)
+    {
+      uart_set_pin(port, wiring_check_gpio_(tx), wiring_check_gpio_(rx), UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+      uart_flush_input(port);
+      uint8_t message_au8[MAX_MESSAGE_SIZE]{};
+      message_au8[1] = CMD_GET_FAN_STATUS;
+      write_array(frame_au8, encodeMessage_(message_au8, frame_au8));
+    }
+    else if (step == 2)
+    {
+      uart_flush_input(port);
+      write_array(frame_au8, encode_panel_clock_frame_(frame_au8));
+    }
+    else
+    {
+      uint8_t reply_au8[MAX_MESSAGE_SIZE];
+      uint8_t length_u8 = 0;
+      uint8_t byte_u8;
+      while (available() != 0 && read_byte(&byte_u8))
+      {
+        if (length_u8 < sizeof(reply_au8))
+        {
+          reply_au8[length_u8++] = byte_u8;
+        }
+      }
+      char hex[MAX_MESSAGE_SIZE * 3];
+      format_hex_pretty_to(hex, reply_au8, length_u8, ' ');
+      ESP_LOGD(TAG, "Wiring check: tx GPIO%d, rx GPIO%d, %s: %u bytes back: %s", wiring_check_pins_[tx],
+               wiring_check_pins_[rx], step == 1 ? "fan poll" : "clock frame", length_u8, hex);
+      if (step == 1)
+      {
+        wiring_check_.note_poll_reply(test, reply_au8, length_u8, RES_GET_FAN_STATUS);
+      }
+      else
+      {
+        wiring_check_.note_reply(test, reply_au8, length_u8);
+        wiring_check_release_pin_(tx);
+      }
+    }
+  }
+
+  void wiring_check_finish_()
+  {
+    for (uint8_t pin = 0; pin < WiringCheck::PIN_COUNT; pin++)
+    {
+      gpio_reset_pin(wiring_check_gpio_(pin));
+    }
+    parent_->load_settings(false);
+    proxy_uart_->load_settings(false);
+    caRxIdx_u8 = 0;
+    csRxIdx_u8 = 0;
+    wiring_check_running_ = false;
+    wiring_check_done_ = true;
+    log_wiring_check_result_();
+  }
+
+  void log_wiring_check_adapter_(const char *name, uint8_t rx_pin, uint8_t tx_pin)
+  {
+    const int rx_gpio = wiring_check_pins_[rx_pin];
+    const int tx_gpio = wiring_check_pins_[tx_pin];
+    switch (wiring_check_.adapter_wiring(rx_pin, tx_pin))
+    {
+    case AdapterWiring::MATCHES_CONFIG:
+      ESP_LOGCONFIG(TAG, "    %s adapter: ESP side matches the config", name);
+      break;
+    case AdapterWiring::SWAPPED:
+      ESP_LOGCONFIG(TAG, "    %s adapter: ESP side is SWAPPED, set rx_pin: GPIO%d and tx_pin: GPIO%d", name, tx_gpio,
+                    rx_gpio);
+      break;
+    case AdapterWiring::NO_OUTPUT:
+      ESP_LOGCONFIG(TAG, "    %s adapter: no output on GPIO%d or GPIO%d, it has no power or is not connected", name,
+                    rx_gpio, tx_gpio);
+      break;
+    case AdapterWiring::BOTH_DRIVEN:
+      ESP_LOGCONFIG(TAG, "    %s adapter: GPIO%d and GPIO%d are both high, levels can't tell them apart", name, rx_gpio,
+                    tx_gpio);
+      break;
+    case AdapterWiring::HELD_LOW:
+      ESP_LOGCONFIG(TAG, "    %s adapter: GPIO%d or GPIO%d is held low, it has no power or its RS232 input is positive",
+                    name, rx_gpio, tx_gpio);
+      break;
+    }
+  }
+
+  // Uses ESP_LOGCONFIG because dump_config() repeats this, so every new log connection shows it.
+  void log_wiring_check_result_()
+  {
+    static const char *const PIN_NAMES[WiringCheck::PIN_COUNT] = {"unit RX", "unit TX", "panel RX", "panel TX"};
+    ESP_LOGCONFIG(TAG, "  Wiring check result:");
+    for (uint8_t pin = 0; pin < WiringCheck::PIN_COUNT; pin++)
+    {
+      const PinDrive drive = wiring_check_.drive(pin);
+      char hex[WiringCheck::HEARD_SAMPLE_SIZE * 3];
+      format_hex_pretty_to(hex, wiring_check_.sample(pin), wiring_check_.sample_length(pin), ' ');
+      ESP_LOGCONFIG(TAG, "    GPIO%d (%s): %s, heard %u bytes: %s", wiring_check_pins_[pin], PIN_NAMES[pin],
+                    drive == PinDrive::DRIVEN_HIGH  ? "driven high (adapter output)"
+                    : drive == PinDrive::DRIVEN_LOW ? "held low"
+                                                    : "not driven (adapter input or no connection)",
+                    wiring_check_.heard(pin), hex);
+    }
+    log_wiring_check_adapter_("Unit", 0, 1);
+    log_wiring_check_adapter_("Panel", 2, 3);
+    if (wiring_check_.test_count() == 0)
+    {
+      ESP_LOGCONFIG(TAG, "    No pin combination could be tested");
+    }
+    for (uint8_t test = 0; test < wiring_check_.test_count(); test++)
+    {
+      ESP_LOGCONFIG(TAG, "    tx GPIO%d, rx GPIO%d: %s", wiring_check_pins_[wiring_check_.test_tx(test)],
+                    wiring_check_pins_[wiring_check_.test_rx(test)],
+                    wiring_check_.unit_answered(test) ? "the UNIT answered"
+                    : wiring_check_.acked(test)       ? "ACK without unit data, probably the PANEL"
+                    : wiring_check_.got_bytes(test)   ? "other bytes came back"
+                                                      : "no answer");
+    }
+  }
+#endif
 
   // --- setter ---
 
@@ -1664,6 +1970,14 @@ protected:
   bool test_panel_frame_{false};
   bool test_ack_panel_frames_{false};
   uint32_t last_test_panel_frame_ms_{0};
+  uint32_t boot_ms_{0};
+  WiringCheck wiring_check_;
+  uint8_t wiring_check_pins_[WiringCheck::PIN_COUNT]{};
+  bool wiring_check_pending_{false};
+  bool wiring_check_running_{false};
+  bool wiring_check_done_{false};
+  int wiring_check_tick_{0};
+  uint32_t wiring_check_tick_ms_{0};
   RawByteCollector unit_raw_;
   RawByteCollector panel_raw_;
 

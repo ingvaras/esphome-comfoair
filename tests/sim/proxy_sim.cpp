@@ -25,11 +25,29 @@ using namespace esphome::comfoair;
 
 typedef std::vector<uint8_t> Bytes;
 
-struct FakeUart : uart::UARTComponent
+struct FakeUart;
+static void wiring_on_write(FakeUart *uart, const uint8_t *d, size_t n);
+static void wiring_on_load_settings(FakeUart *uart);
+
+struct FakeUart : uart::IDFUARTComponent
 {
   std::deque<uint8_t> rx; // bytes the component will read
   Bytes tx;               // bytes the component wrote
-  void write_array(const uint8_t *d, size_t n) override { tx.insert(tx.end(), d, d + n); }
+  bool wired{false};      // part of the wiring model below
+  int load_settings_calls{0};
+  void write_array(const uint8_t *d, size_t n) override
+  {
+    tx.insert(tx.end(), d, d + n);
+    if (wired)
+    {
+      wiring_on_write(this, d, n);
+    }
+  }
+  void load_settings(bool) override
+  {
+    load_settings_calls++;
+    wiring_on_load_settings(this);
+  }
   size_t available() override { return rx.size(); }
   bool read_byte(uint8_t *b) override
   {
@@ -260,6 +278,258 @@ static void test_ack_panel_frames()
   CHECK(off.panel.tx.empty());
 }
 
+// --- Wiring model for the wiring check: adapter #1 on GPIO16/17, adapter #2 on GPIO18/19. ---
+
+struct WiringModel
+{
+  // Levels of adapter outputs; every other pin follows the ESP's pull resistor.
+  bool driven_high[40]{};
+  bool driven_low[40]{};
+  // The ESP pin that reaches each device's receive and transmit line (-1: not connected).
+  int unit_in{-1}, unit_out{-1}, panel_in{-1}, panel_out{-1};
+  bool pull_up[40]{};
+  int tx[3]{-1, -1, -1}; // per UART port
+  int rx[3]{-1, -1, -1};
+  FakeUart *uarts[3]{nullptr, nullptr, nullptr};
+  int level_reads{0};
+  int writes_on_driven_pin{0};
+};
+static WiringModel g_wiring;
+
+void gpio_reset_pin(gpio_num_t pin)
+{
+  g_wiring.pull_up[pin] = true;
+  for (int port = 1; port <= 2; port++)
+  {
+    if (g_wiring.tx[port] == pin)
+    {
+      g_wiring.tx[port] = -1;
+    }
+  }
+}
+void gpio_set_direction(gpio_num_t, gpio_mode_t) {}
+void gpio_set_pull_mode(gpio_num_t pin, gpio_pull_mode_t pull) { g_wiring.pull_up[pin] = pull == GPIO_PULLUP_ONLY; }
+int gpio_get_level(gpio_num_t pin)
+{
+  g_wiring.level_reads++;
+  return g_wiring.driven_high[pin] || (!g_wiring.driven_low[pin] && g_wiring.pull_up[pin]) ? 1 : 0;
+}
+void uart_set_pin(uart_port_t port, int tx, int rx, int, int)
+{
+  if (tx != UART_PIN_NO_CHANGE)
+  {
+    g_wiring.tx[port] = tx;
+  }
+  if (rx != UART_PIN_NO_CHANGE)
+  {
+    g_wiring.rx[port] = rx;
+  }
+}
+void uart_flush_input(uart_port_t port) { g_wiring.uarts[port]->rx.clear(); }
+
+// Bytes a device sends on `pin` reach every UART listening on that pin.
+static void wiring_deliver(int pin, const Bytes &bytes)
+{
+  for (int port = 1; port <= 2; port++)
+  {
+    if (pin >= 0 && g_wiring.rx[port] == pin)
+    {
+      g_wiring.uarts[port]->feed(bytes);
+    }
+  }
+}
+
+// The devices answer frames (not ACKs): the unit with an ACK plus its data, the panel with an ACK.
+static void wiring_on_write(FakeUart *uart, const uint8_t *d, size_t n)
+{
+  const int pin = g_wiring.tx[uart->port];
+  if (pin < 0)
+  {
+    return;
+  }
+  if (g_wiring.driven_high[pin] || g_wiring.driven_low[pin])
+  {
+    g_wiring.writes_on_driven_pin++;
+  }
+  if (n < 4)
+  {
+    return;
+  }
+  if (pin == g_wiring.unit_in)
+  {
+    wiring_deliver(g_wiring.unit_out, d[3] == CMD_GET_FAN_STATUS ? concat(ACK, frame(RES_GET_FAN_STATUS, {50, 50, 0, 0, 0, 0})) : ACK);
+  }
+  if (pin == g_wiring.panel_in)
+  {
+    wiring_deliver(g_wiring.panel_out, ACK);
+  }
+}
+
+static void wiring_on_load_settings(FakeUart *uart)
+{
+  g_wiring.tx[uart->port] = uart->port == 1 ? 17 : 19;
+  g_wiring.rx[uart->port] = uart->port == 1 ? 16 : 18;
+}
+
+struct WiredRig : Rig
+{
+  // Pass the pins as they really are; the UARTs are always configured as 16/17 and 18/19.
+  WiredRig(int unit_output_pin, int unit_input_pin, int panel_output_pin, int panel_input_pin) : Rig(true)
+  {
+    g_wiring = WiringModel();
+    g_wiring.uarts[1] = &unit;
+    g_wiring.uarts[2] = &panel;
+    unit.port = 1;
+    panel.port = 2;
+    unit.wired = true;
+    panel.wired = true;
+    wiring_on_load_settings(&unit);
+    wiring_on_load_settings(&panel);
+    if (unit_output_pin >= 0)
+    {
+      g_wiring.driven_high[unit_output_pin] = true;
+      g_wiring.unit_out = unit_output_pin;
+      g_wiring.unit_in = unit_input_pin;
+    }
+    if (panel_output_pin >= 0)
+    {
+      g_wiring.driven_high[panel_output_pin] = true;
+      g_wiring.panel_out = panel_output_pin;
+      g_wiring.panel_in = panel_input_pin;
+    }
+    c.set_wiring_check_pins(16, 17, 18, 19);
+  }
+
+  // Polls every 2s as PollingComponent does; the panel polls by itself every second.
+  void run_wired(uint32_t ms)
+  {
+    for (uint32_t i = 0; i < ms; i++)
+    {
+      g_now++;
+      if (g_now % 2000 == 0)
+      {
+        c.update();
+      }
+      if (g_now % 1000 == 500)
+      {
+        wiring_deliver(g_wiring.panel_out, frame(CMD_GET_TEMPERATURES, {}));
+      }
+      c.loop();
+    }
+  }
+
+  // The result of the test using these pins (numbered as in WiringCheck).
+  int find_test(uint8_t tx, uint8_t rx) const
+  {
+    const WiringCheck &w = c.wiring_check();
+    for (uint8_t test = 0; test < w.test_count(); test++)
+    {
+      if (w.test_tx(test) == tx && w.test_rx(test) == rx)
+      {
+        return test;
+      }
+    }
+    return -1;
+  }
+};
+
+static const uint32_t WIRING_CHECK_FINISHED_MS = 120000;
+
+// Healthy links: the check never touches the pins.
+static void test_wiring_check_not_needed()
+{
+  WiredRig r(16, 17, 18, 19);
+  r.run_wired(WIRING_CHECK_FINISHED_MS);
+  CHECK(!r.c.wiring_check_done());
+  CHECK(!r.c.wiring_check_running());
+  CHECK(g_wiring.level_reads == 0);
+  CHECK(r.unit.load_settings_calls == 0);
+}
+
+// Without set_wiring_check_pins() (wiring_check: false) nothing runs, however silent the bus is.
+static void test_wiring_check_disabled()
+{
+  Rig r(true);
+  g_wiring = WiringModel();
+  r.run(WIRING_CHECK_FINISHED_MS);
+  CHECK(!r.c.wiring_check_done());
+  CHECK(g_wiring.level_reads == 0);
+}
+
+// Unit adapter's TXD/RXD crossed at the ESP: found, answered on the swapped pins, then
+// normal operation resumes on the configured pins.
+static void test_wiring_check_unit_swapped()
+{
+  WiredRig r(17, 16, 18, 19);
+  r.run_wired(WIRING_CHECK_DELAY_MS - 1000);
+  CHECK(!r.c.wiring_check_running()); // not before the delay
+  r.run_wired(2000);
+  CHECK(r.c.wiring_check_running());
+  const int writes_on_driven_pin_before = g_wiring.writes_on_driven_pin; // normal polls did, with swapped wires
+  size_t unit_tx_while_running = r.unit.tx.size();
+  r.run_wired(29000); // listening only: passive, and the polls are paused
+  CHECK(r.c.wiring_check_running());
+  CHECK(r.unit.tx.size() == unit_tx_while_running);
+  while (r.c.wiring_check_running())
+  {
+    r.run_wired(1);
+  }
+  CHECK(r.c.wiring_check_done());
+
+  const WiringCheck &w = r.c.wiring_check();
+  CHECK(w.adapter_wiring(0, 1) == AdapterWiring::SWAPPED);
+  CHECK(w.adapter_wiring(2, 3) == AdapterWiring::MATCHES_CONFIG);
+  CHECK(w.test_count() == 4);
+  CHECK(g_wiring.writes_on_driven_pin == writes_on_driven_pin_before); // the check never fought an adapter output...
+  const int unit_test = r.find_test(0, 1); // ...and sent on GPIO16, listened on GPIO17
+  CHECK(unit_test >= 0 && w.unit_answered(unit_test));
+  const int panel_test = r.find_test(3, 2);
+  CHECK(panel_test >= 0 && w.acked(panel_test) && !w.unit_answered(panel_test));
+  const int crossed_test = r.find_test(0, 2);
+  CHECK(crossed_test >= 0 && !w.unit_answered(crossed_test));
+  CHECK(w.heard(2) > 0 && w.sample(2)[0] == 0x07 && w.sample(2)[1] == 0xF0); // the panel's polls
+  CHECK(w.heard(0) == 0 && w.heard(3) == 0);
+
+  // UARTs restored, polls resume, and the check does not run a second time.
+  CHECK(r.unit.load_settings_calls == 1 && r.panel.load_settings_calls == 1);
+  CHECK(g_wiring.tx[1] == 17 && g_wiring.rx[1] == 16 && g_wiring.tx[2] == 19 && g_wiring.rx[2] == 18);
+  const size_t unit_tx_after = r.unit.tx.size();
+  const int level_reads_after = g_wiring.level_reads;
+  r.run_wired(WIRING_CHECK_FINISHED_MS);
+  CHECK(r.unit.tx.size() > unit_tx_after);
+  CHECK(g_wiring.level_reads == level_reads_after);
+}
+
+// Panel adapter unpowered: reported as such, the unit link is confirmed.
+static void test_wiring_check_panel_no_output()
+{
+  WiredRig r(16, 17, -1, -1);
+  r.run_wired(WIRING_CHECK_FINISHED_MS);
+  CHECK(r.c.wiring_check_done());
+  const WiringCheck &w = r.c.wiring_check();
+  CHECK(w.adapter_wiring(0, 1) == AdapterWiring::MATCHES_CONFIG);
+  CHECK(w.adapter_wiring(2, 3) == AdapterWiring::NO_OUTPUT);
+  const int unit_test = r.find_test(1, 0);
+  CHECK(unit_test >= 0 && w.unit_answered(unit_test));
+}
+
+// ESP side correct on both adapters but nothing beyond them (e.g. crossed cable-side wires).
+static void test_wiring_check_nothing_answers()
+{
+  WiredRig r(16, 17, 18, 19);
+  g_wiring.unit_in = g_wiring.unit_out = g_wiring.panel_in = g_wiring.panel_out = -1;
+  r.run_wired(WIRING_CHECK_FINISHED_MS);
+  CHECK(r.c.wiring_check_done());
+  const WiringCheck &w = r.c.wiring_check();
+  CHECK(w.adapter_wiring(0, 1) == AdapterWiring::MATCHES_CONFIG);
+  CHECK(w.adapter_wiring(2, 3) == AdapterWiring::MATCHES_CONFIG);
+  CHECK(w.test_count() == 4);
+  for (uint8_t test = 0; test < w.test_count(); test++)
+  {
+    CHECK(!w.got_bytes(test) && !w.acked(test) && !w.unit_answered(test));
+  }
+}
+
 int main()
 {
   test_transparent_relay();
@@ -269,6 +539,11 @@ int main()
   test_fake_unit_reply();
   test_panel_frame();
   test_ack_panel_frames();
+  test_wiring_check_not_needed();
+  test_wiring_check_disabled();
+  test_wiring_check_unit_swapped();
+  test_wiring_check_panel_no_output();
+  test_wiring_check_nothing_answers();
   std::printf("all proxy simulation tests passed\n");
   return 0;
 }

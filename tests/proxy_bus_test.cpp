@@ -113,6 +113,112 @@ static void test_hold_buffer()
   CHECK(h.empty());
 }
 
+static void test_wiring_classify_pin()
+{
+  const uint8_t all = WiringCheck::SAMPLES_PER_PULL;
+  CHECK(WiringCheck::classify_pin(all, all) == PinDrive::DRIVEN_HIGH);
+  CHECK(WiringCheck::classify_pin(all, 0) == PinDrive::NOT_DRIVEN);
+  CHECK(WiringCheck::classify_pin(0, 0) == PinDrive::DRIVEN_LOW);
+  // Traffic on an adapter output makes single reads low.
+  CHECK(WiringCheck::classify_pin(all - 2, all - 3) == PinDrive::DRIVEN_HIGH);
+}
+
+static void test_wiring_adapter_verdict()
+{
+  WiringCheck w;
+  w.set_drive(0, PinDrive::DRIVEN_HIGH);
+  w.set_drive(1, PinDrive::NOT_DRIVEN);
+  CHECK(w.adapter_wiring(0, 1) == AdapterWiring::MATCHES_CONFIG);
+  CHECK(w.adapter_wiring(1, 0) == AdapterWiring::SWAPPED);
+  w.set_drive(0, PinDrive::NOT_DRIVEN);
+  CHECK(w.adapter_wiring(0, 1) == AdapterWiring::NO_OUTPUT);
+  w.set_drive(0, PinDrive::DRIVEN_HIGH);
+  w.set_drive(1, PinDrive::DRIVEN_HIGH);
+  CHECK(w.adapter_wiring(0, 1) == AdapterWiring::BOTH_DRIVEN);
+  w.set_drive(1, PinDrive::DRIVEN_LOW);
+  CHECK(w.adapter_wiring(0, 1) == AdapterWiring::HELD_LOW);
+}
+
+static void test_wiring_plan()
+{
+  // Normal case: transmit on undriven pins only, listen on adapter outputs.
+  WiringCheck w;
+  w.set_drive(0, PinDrive::DRIVEN_HIGH);
+  w.set_drive(1, PinDrive::NOT_DRIVEN);
+  w.set_drive(2, PinDrive::NOT_DRIVEN);
+  w.set_drive(3, PinDrive::DRIVEN_HIGH);
+  w.plan_tests();
+  CHECK(w.test_count() == 4);
+  for (uint8_t test = 0; test < w.test_count(); test++)
+  {
+    CHECK(w.drive(w.test_tx(test)) == PinDrive::NOT_DRIVEN);
+    CHECK(w.drive(w.test_rx(test)) == PinDrive::DRIVEN_HIGH);
+  }
+
+  // Both pins of an adapter high: both are tried, in both directions.
+  WiringCheck both;
+  both.set_drive(0, PinDrive::DRIVEN_HIGH);
+  both.set_drive(1, PinDrive::DRIVEN_HIGH);
+  both.set_drive(2, PinDrive::NOT_DRIVEN);
+  both.set_drive(3, PinDrive::NOT_DRIVEN);
+  both.plan_tests();
+  CHECK(both.test_count() == 6); // 0->1, 1->0, and each of 2 and 3 to 0 and 1
+
+  // No adapter output anywhere: nothing can be tested.
+  WiringCheck none;
+  for (uint8_t pin = 0; pin < WiringCheck::PIN_COUNT; pin++)
+  {
+    none.set_drive(pin, PinDrive::NOT_DRIVEN);
+  }
+  none.plan_tests();
+  CHECK(none.test_count() == 0);
+
+  // Every pin driven: the plan stays within its capacity.
+  WiringCheck all;
+  for (uint8_t pin = 0; pin < WiringCheck::PIN_COUNT; pin++)
+  {
+    all.set_drive(pin, PinDrive::DRIVEN_HIGH);
+  }
+  all.plan_tests();
+  CHECK(all.test_count() == WiringCheck::MAX_TESTS);
+}
+
+static void test_wiring_replies()
+{
+  WiringCheck w;
+  const uint8_t unit_reply[] = {0x07, 0xF3, 0x07, 0xF0, 0x00, 0x0C, 0x06};
+  w.note_poll_reply(0, unit_reply, sizeof(unit_reply), 0x0C);
+  CHECK(w.unit_answered(0) && w.acked(0) && w.got_bytes(0));
+
+  const uint8_t ack_only[] = {0x07, 0xF3};
+  w.note_poll_reply(1, ack_only, sizeof(ack_only), 0x0C);
+  CHECK(!w.unit_answered(1) && w.acked(1) && w.got_bytes(1));
+
+  const uint8_t junk[] = {0x12, 0x34, 0x07};
+  w.note_poll_reply(2, junk, sizeof(junk), 0x0C);
+  CHECK(!w.unit_answered(2) && !w.acked(2) && w.got_bytes(2));
+
+  w.note_poll_reply(3, nullptr, 0, 0x0C);
+  CHECK(!w.unit_answered(3) && !w.acked(3) && !w.got_bytes(3));
+
+  // A later reply never clears an earlier one.
+  w.note_reply(1, nullptr, 0);
+  CHECK(w.acked(1));
+}
+
+static void test_wiring_heard()
+{
+  WiringCheck w;
+  for (uint16_t i = 0; i < WiringCheck::HEARD_SAMPLE_SIZE + 10U; i++)
+  {
+    w.note_heard(2, (uint8_t)i);
+  }
+  CHECK(w.heard(2) == WiringCheck::HEARD_SAMPLE_SIZE + 10U);
+  CHECK(w.sample_length(2) == WiringCheck::HEARD_SAMPLE_SIZE);
+  CHECK(w.sample(2)[3] == 3);
+  CHECK(w.heard(0) == 0 && w.sample_length(0) == 0);
+}
+
 int main()
 {
   test_idle_gap();
@@ -121,6 +227,11 @@ int main()
   test_millis_wraparound();
   test_queue();
   test_hold_buffer();
+  test_wiring_classify_pin();
+  test_wiring_adapter_verdict();
+  test_wiring_plan();
+  test_wiring_replies();
+  test_wiring_heard();
   std::printf("all proxy bus tests passed\n");
   return 0;
 }

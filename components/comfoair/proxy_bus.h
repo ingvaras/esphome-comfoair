@@ -80,6 +80,10 @@ public:
 
   bool own_exchange() const { return own_exchange_; }
 
+  // Whether any byte was ever received from that side.
+  bool unit_seen() const { return unit_seen_; }
+  bool panel_seen() const { return panel_seen_; }
+
   bool own_exchange_timed_out(uint32_t now_ms) const
   {
     return own_exchange_ && (now_ms - own_exchange_start_ms_) >= PROXY_OWN_EXCHANGE_TIMEOUT_MS;
@@ -223,6 +227,167 @@ private:
   uint8_t data_[CAPACITY];
   uint8_t length_{0};
   uint32_t last_byte_ms_{0};
+};
+
+// What a pin looks like to the ESP. An adapter's output drives the pin and ignores
+// the ESP's weak pull resistors; an adapter's input or a loose wire follows them.
+enum class PinDrive : uint8_t
+{
+  UNKNOWN,
+  DRIVEN_HIGH,
+  DRIVEN_LOW,
+  NOT_DRIVEN,
+};
+
+enum class AdapterWiring : uint8_t
+{
+  MATCHES_CONFIG,
+  SWAPPED,
+  NO_OUTPUT,
+  BOTH_DRIVEN,
+  HELD_LOW,
+};
+
+// Results and test plan of the wiring check. Pins are numbered in the order
+// unit RX, unit TX, panel RX, panel TX, as configured.
+class WiringCheck
+{
+public:
+  static const uint8_t PIN_COUNT = 4U;
+  static const uint8_t SAMPLES_PER_PULL = 10U;
+  static const uint8_t HEARD_SAMPLE_SIZE = 24U;
+  static const uint8_t MAX_TESTS = 12U;
+
+  // Arguments: how many of SAMPLES_PER_PULL reads were high with each pull. Traffic
+  // can make single reads differ, so the majority decides.
+  static PinDrive classify_pin(uint8_t high_with_pullup, uint8_t high_with_pulldown)
+  {
+    if (high_with_pulldown >= SAMPLES_PER_PULL / 2U)
+    {
+      return PinDrive::DRIVEN_HIGH;
+    }
+    if (high_with_pullup <= SAMPLES_PER_PULL / 2U)
+    {
+      return PinDrive::DRIVEN_LOW;
+    }
+    return PinDrive::NOT_DRIVEN;
+  }
+
+  void set_drive(uint8_t pin, PinDrive drive) { drive_[pin] = drive; }
+  PinDrive drive(uint8_t pin) const { return drive_[pin]; }
+
+  AdapterWiring adapter_wiring(uint8_t rx_pin, uint8_t tx_pin) const
+  {
+    const PinDrive rx = drive_[rx_pin];
+    const PinDrive tx = drive_[tx_pin];
+    if (rx == PinDrive::DRIVEN_HIGH && tx == PinDrive::NOT_DRIVEN)
+    {
+      return AdapterWiring::MATCHES_CONFIG;
+    }
+    if (rx == PinDrive::NOT_DRIVEN && tx == PinDrive::DRIVEN_HIGH)
+    {
+      return AdapterWiring::SWAPPED;
+    }
+    if (rx == PinDrive::NOT_DRIVEN && tx == PinDrive::NOT_DRIVEN)
+    {
+      return AdapterWiring::NO_OUTPUT;
+    }
+    if (rx == PinDrive::DRIVEN_HIGH && tx == PinDrive::DRIVEN_HIGH)
+    {
+      return AdapterWiring::BOTH_DRIVEN;
+    }
+    return AdapterWiring::HELD_LOW;
+  }
+
+  void note_heard(uint8_t pin, uint8_t byte)
+  {
+    if (sample_length_[pin] < HEARD_SAMPLE_SIZE)
+    {
+      sample_[pin][sample_length_[pin]++] = byte;
+    }
+    heard_[pin]++;
+  }
+  uint16_t heard(uint8_t pin) const { return heard_[pin]; }
+  const uint8_t *sample(uint8_t pin) const { return sample_[pin]; }
+  uint8_t sample_length(uint8_t pin) const { return sample_length_[pin]; }
+
+  // Listen on every adapter output and only transmit on pins the adapter is not
+  // driving, so two outputs never fight. If both pins of an adapter look driven,
+  // the levels can't separate them, so both are tried.
+  void plan_tests()
+  {
+    test_count_ = 0;
+    for (uint8_t tx = 0; tx < PIN_COUNT; tx++)
+    {
+      const bool both_driven = drive_[tx] == PinDrive::DRIVEN_HIGH && drive_[tx ^ 1U] == PinDrive::DRIVEN_HIGH;
+      if (drive_[tx] != PinDrive::NOT_DRIVEN && !both_driven)
+      {
+        continue;
+      }
+      for (uint8_t rx = 0; rx < PIN_COUNT; rx++)
+      {
+        if (rx != tx && drive_[rx] == PinDrive::DRIVEN_HIGH && test_count_ < MAX_TESTS)
+        {
+          test_tx_[test_count_] = tx;
+          test_rx_[test_count_] = rx;
+          test_count_++;
+        }
+      }
+    }
+  }
+  uint8_t test_count() const { return test_count_; }
+  uint8_t test_tx(uint8_t test) const { return test_tx_[test]; }
+  uint8_t test_rx(uint8_t test) const { return test_rx_[test]; }
+
+  // `response_command` is what only the unit sends in answer to our poll.
+  void note_poll_reply(uint8_t test, const uint8_t *data, uint8_t length, uint8_t response_command)
+  {
+    const uint8_t response[] = {0x07, 0xF0, 0x00, response_command};
+    if (contains_(data, length, response, sizeof(response)))
+    {
+      unit_answered_[test] = true;
+    }
+    note_reply(test, data, length);
+  }
+  void note_reply(uint8_t test, const uint8_t *data, uint8_t length)
+  {
+    const uint8_t ack[] = {0x07, 0xF3};
+    if (contains_(data, length, ack, sizeof(ack)))
+    {
+      acked_[test] = true;
+    }
+    if (length != 0)
+    {
+      got_bytes_[test] = true;
+    }
+  }
+  bool unit_answered(uint8_t test) const { return unit_answered_[test]; }
+  bool acked(uint8_t test) const { return acked_[test]; }
+  bool got_bytes(uint8_t test) const { return got_bytes_[test]; }
+
+private:
+  static bool contains_(const uint8_t *data, uint8_t length, const uint8_t *pattern, uint8_t pattern_length)
+  {
+    for (uint8_t i = 0; i + pattern_length <= length; i++)
+    {
+      if (memcmp(data + i, pattern, pattern_length) == 0)
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  PinDrive drive_[PIN_COUNT]{PinDrive::UNKNOWN, PinDrive::UNKNOWN, PinDrive::UNKNOWN, PinDrive::UNKNOWN};
+  uint16_t heard_[PIN_COUNT]{};
+  uint8_t sample_[PIN_COUNT][HEARD_SAMPLE_SIZE]{};
+  uint8_t sample_length_[PIN_COUNT]{};
+  uint8_t test_tx_[MAX_TESTS]{};
+  uint8_t test_rx_[MAX_TESTS]{};
+  uint8_t test_count_{0};
+  bool unit_answered_[MAX_TESTS]{};
+  bool acked_[MAX_TESTS]{};
+  bool got_bytes_[MAX_TESTS]{};
 };
 
 } // namespace comfoair

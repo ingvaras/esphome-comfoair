@@ -19,7 +19,10 @@ from esphome.const import (
     CONF_INITIAL_VALUE,
     CONF_MAX_VALUE,
     CONF_MIN_VALUE,
+    CONF_NUMBER,
+    CONF_RX_PIN,
     CONF_STEP,
+    CONF_TX_PIN,
     CONF_UART_ID,
     DEVICE_CLASS_CURRENT,
     DEVICE_CLASS_EMPTY,
@@ -36,6 +39,7 @@ from esphome.const import (
     UNIT_PERCENT,
     UNIT_REVOLUTIONS_PER_MINUTE,
 )
+from esphome.core import CORE
 
 comfoair_ns = cg.esphome_ns.namespace("comfoair")
 
@@ -57,6 +61,7 @@ CONF_LOG_RAW_BYTES = "log_raw_bytes"
 CONF_TEST_FAKE_UNIT_REPLY = "test_fake_unit_reply"
 CONF_TEST_PANEL_FRAME = "test_panel_frame"
 CONF_TEST_ACK_PANEL_FRAMES = "test_ack_panel_frames"
+CONF_WIRING_CHECK = "wiring_check"
 
 UNIT_WEEK = "weeks"
 
@@ -722,12 +727,21 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_TEST_FAKE_UNIT_REPLY, default=False): cv.boolean,
             cv.Optional(CONF_TEST_PANEL_FRAME, default=False): cv.boolean,
             cv.Optional(CONF_TEST_ACK_PANEL_FRAMES, default=False): cv.boolean,
+            cv.Optional(CONF_WIRING_CHECK, default=True): cv.boolean,
         }
     )
     .extend(uart.UART_DEVICE_SCHEMA)
     .extend(comfoair_sensors_schemas),
     validate_proxy_uart,
 )
+
+def uart_pin_numbers(uart_id):
+    """Returns the (RX, TX) GPIO numbers of a configured UART."""
+    for uart_config in CORE.config["uart"]:  # pylint: disable=unsubscriptable-object
+        if uart_config[CONF_ID] == uart_id:
+            return (uart_config[CONF_RX_PIN][CONF_NUMBER], uart_config[CONF_TX_PIN][CONF_NUMBER])
+    raise cv.Invalid(f"UART {uart_id} not found")
+
 
 def to_code(config):
     """Generates code"""
@@ -745,6 +759,13 @@ def to_code(config):
     if CONF_PROXY_UART_ID in config:
         proxy_paren = yield cg.get_variable(config[CONF_PROXY_UART_ID])
         cg.add(var.set_proxy_uart(proxy_paren))
+        if config[CONF_WIRING_CHECK] and CORE.is_esp32:
+            cg.add(
+                var.set_wiring_check_pins(
+                    *uart_pin_numbers(config[CONF_UART_ID]),
+                    *uart_pin_numbers(config[CONF_PROXY_UART_ID]),
+                )
+            )
     for k, values in helper_comfoair.items():
         for v in values:
             if not v in config:
