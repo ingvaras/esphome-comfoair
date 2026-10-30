@@ -62,6 +62,7 @@ CONF_TEST_FAKE_UNIT_REPLY = "test_fake_unit_reply"
 CONF_TEST_PANEL_FRAME = "test_panel_frame"
 CONF_TEST_ACK_PANEL_FRAMES = "test_ack_panel_frames"
 CONF_WIRING_CHECK = "wiring_check"
+CONF_UNIT_WRITE_ONLY = "unit_write_only"
 
 UNIT_WEEK = "weeks"
 
@@ -695,6 +696,8 @@ def validate_proxy_uart(config):
             f"{CONF_PROXY_UART_ID} must differ from {CONF_UART_ID}: "
             "the unit and the ComfoSense panel need individual UARTs"
         )
+    if config[CONF_UNIT_WRITE_ONLY] and CONF_PROXY_UART_ID not in config:
+        raise cv.Invalid(f"{CONF_UNIT_WRITE_ONLY} requires {CONF_PROXY_UART_ID}")
     return config
 
 
@@ -728,6 +731,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_TEST_PANEL_FRAME, default=False): cv.boolean,
             cv.Optional(CONF_TEST_ACK_PANEL_FRAMES, default=False): cv.boolean,
             cv.Optional(CONF_WIRING_CHECK, default=True): cv.boolean,
+            cv.Optional(CONF_UNIT_WRITE_ONLY, default=False): cv.boolean,
         }
     )
     .extend(uart.UART_DEVICE_SCHEMA)
@@ -756,10 +760,12 @@ def to_code(config):
     cg.add(var.set_test_fake_unit_reply(config[CONF_TEST_FAKE_UNIT_REPLY]))
     cg.add(var.set_test_panel_frame(config[CONF_TEST_PANEL_FRAME]))
     cg.add(var.set_test_ack_panel_frames(config[CONF_TEST_ACK_PANEL_FRAMES]))
+    cg.add(var.set_unit_write_only(config[CONF_UNIT_WRITE_ONLY]))
     if CONF_PROXY_UART_ID in config:
         proxy_paren = yield cg.get_variable(config[CONF_PROXY_UART_ID])
         cg.add(var.set_proxy_uart(proxy_paren))
-        if config[CONF_WIRING_CHECK] and CORE.is_esp32:
+        # A write-only unit is silent by design, which would start the check on every boot.
+        if config[CONF_WIRING_CHECK] and not config[CONF_UNIT_WRITE_ONLY] and CORE.is_esp32:
             cg.add(
                 var.set_wiring_check_pins(
                     *uart_pin_numbers(config[CONF_UART_ID]),

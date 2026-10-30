@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -64,6 +65,44 @@ inline char *format_hex_pretty_to(char (&buffer)[N], const uint8_t *data, size_t
   }
   return buffer;
 }
+
+// Stored values outlive a ComfoAirComponent, as flash outlives a restart.
+inline std::map<uint32_t, std::vector<uint8_t>> &sim_preferences()
+{
+  static std::map<uint32_t, std::vector<uint8_t>> store;
+  return store;
+}
+class ESPPreferenceObject
+{
+public:
+  explicit ESPPreferenceObject(uint32_t type = 0) : type_(type) {}
+  template <typename T> bool load(T *dest)
+  {
+    auto it = sim_preferences().find(type_);
+    if (it == sim_preferences().end() || it->second.size() != sizeof(T))
+    {
+      return false;
+    }
+    memcpy(dest, it->second.data(), sizeof(T));
+    return true;
+  }
+  template <typename T> bool save(const T *src)
+  {
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(src);
+    sim_preferences()[type_] = std::vector<uint8_t>(bytes, bytes + sizeof(T));
+    return true;
+  }
+
+private:
+  uint32_t type_;
+};
+class ESPPreferences
+{
+public:
+  template <typename T> ESPPreferenceObject make_preference(uint32_t type, bool) { return ESPPreferenceObject(type); }
+};
+inline ESPPreferences *global_preferences = new ESPPreferences();
+inline uint32_t fnv1_hash(const char *) { return 1; }
 
 class Component
 {

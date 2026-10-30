@@ -96,6 +96,19 @@ RS232 side, because software can't tell crossed wires from a device that is
 disconnected or has no power. The check sends the panel's clock frame (Monday
 12:34) and a fan status request. Set `wiring_check: false` to disable it.
 
+**Unit with a broken TX (`unit_write_only: true`):** if the unit can receive but
+never answers, the ESP takes its place towards the panel. It acknowledges every
+panel frame, answers the panel's polls and relays the panel's commands to the
+unit. The ventilation level and comfort temperature set from the panel or Home
+Assistant are remembered across restarts, and the level is re-sent to the unit
+every 5 minutes because the unit can't confirm it. Polling stops, and the wiring
+check is turned off.
+
+Everything that comes from the unit is lost, in Home Assistant and on the panel:
+temperatures, fan speeds, filter status, bypass and faults. **The panel always
+reports no faults and a clean filter, so real alarms from the unit stay hidden.**
+The replies use typical fan settings and report the temperature sensors as absent.
+
 Port of the ComfoAir protocol to ESPHome.io firmware, which is supported by external_components.
 
 The component sends one protocol request every two seconds. After the initial

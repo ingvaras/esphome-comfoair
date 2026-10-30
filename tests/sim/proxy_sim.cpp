@@ -93,13 +93,14 @@ struct Rig
   FakeUart unit, panel;
   ComfoAirComponent c;
   sensor::Sensor intake;
-  explicit Rig(bool proxy)
+  explicit Rig(bool proxy, bool write_only = false)
   {
     c.set_uart_component(&unit);
     if (proxy)
     {
       c.set_proxy_uart(&panel);
     }
+    c.set_unit_write_only(write_only);
     c.intake_fan_speed = &intake;
     c.setup();
   }
@@ -530,6 +531,150 @@ static void test_wiring_check_nothing_answers()
   }
 }
 
+// --- unit_write_only: the unit hears commands but never answers ---
+
+static Bytes ask_panel(Rig &r, const Bytes &request)
+{
+  r.panel.tx.clear();
+  r.panel.feed(request);
+  r.run(2);
+  return r.panel.tx;
+}
+
+// Real panel polls carry one data byte: 07 F0 00 CD 01 00 7B 07 0F
+static Bytes level_reply(uint8_t level, uint8_t percent)
+{
+  return concat(ACK, frame(RES_GET_VENTILATION_LEVEL, {15, 35, 50, 15, 35, 50, percent, percent, level, 1, 70, 70, 0, 0}));
+}
+
+static void test_write_only_answers_panel()
+{
+  sim_preferences().clear();
+  Rig r(true, true);
+  CHECK(ask_panel(r, frame(CMD_GET_VENTILATION_LEVEL, {0})) == level_reply(2, 35));
+  CHECK(ask_panel(r, frame(CMD_GET_TEMPERATURES, {0})) == concat(ACK, frame(RES_GET_TEMPERATURES, {80, 80, 80, 80, 80, 0, 0, 0, 0})));
+  CHECK(ask_panel(r, frame(CMD_GET_STATUS, {0})) == concat(ACK, frame(RES_GET_STATUS, {0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0})));
+  CHECK(ask_panel(r, frame(CMD_GET_FAULTS, {0})) == concat(ACK, frame(RES_GET_FAULTS, Bytes(17, 0))));
+  CHECK(ask_panel(r, frame(CMD_GET_RF_STATUS, {0})) == concat(ACK, frame(RES_GET_RF_STATUS, Bytes(7, 0))));
+
+  // No known reply format: acknowledged only.
+  CHECK(ask_panel(r, frame(CMD_GET_DATA, {0})) == ACK);
+  CHECK(ask_panel(r, frame(CMD_CCEASE_BUTTON_STATUS, {0, 0, 0, 0, 0, 0, 2})) == ACK);
+  // The panel's own ACK is not acknowledged.
+  CHECK(ask_panel(r, ACK).empty());
+
+  // Everything still reaches the unit, unchanged.
+  r.unit.tx.clear();
+  r.panel.feed(frame(CMD_GET_TEMPERATURES, {0}));
+  r.run(2);
+  CHECK(r.unit.tx == frame(CMD_GET_TEMPERATURES, {0}));
+}
+
+static void test_write_only_panel_sets_level()
+{
+  sim_preferences().clear();
+  Rig r(true, true);
+  r.panel.tx.clear();
+  CHECK(ask_panel(r, frame(CMD_SET_LEVEL, {3})) == ACK);
+  CHECK(r.unit.tx == frame(CMD_SET_LEVEL, {3}));
+  CHECK(r.c.fan_mode.value() == climate::CLIMATE_FAN_MEDIUM);
+  CHECK(ask_panel(r, frame(CMD_GET_VENTILATION_LEVEL, {0})) == level_reply(3, 50));
+
+  // An invalid level is passed on like any frame but not remembered.
+  CHECK(ask_panel(r, frame(CMD_SET_LEVEL, {9})) == ACK);
+  CHECK(ask_panel(r, frame(CMD_GET_VENTILATION_LEVEL, {0})) == level_reply(3, 50));
+
+  CHECK(ask_panel(r, frame(CMD_SET_COMFORT_TEMPERATURE, {90})) == ACK);
+  CHECK(ask_panel(r, frame(CMD_GET_TEMPERATURES, {0})) == concat(ACK, frame(RES_GET_TEMPERATURES, {90, 90, 90, 90, 90, 0, 0, 0, 0})));
+}
+
+// Home Assistant updates the unit directly and the panel at its next poll.
+static void test_write_only_home_assistant_sets_level()
+{
+  sim_preferences().clear();
+  Rig r(true, true);
+  r.ha_set_level(4);
+  r.run(PROXY_IDLE_GAP_MS + 2);
+  const Bytes command = frame(CMD_SET_LEVEL, {4});
+  CHECK(r.unit.tx == command);
+  CHECK(r.panel.tx.empty());
+  r.run(2 * PROXY_OWN_EXCHANGE_TIMEOUT_MS + 50);
+  CHECK(r.unit.tx == concat(command, command)); // sent twice, since it can't be confirmed
+  r.run(PROXY_OWN_EXCHANGE_TIMEOUT_MS + 50);
+  CHECK(r.unit.tx == concat(command, command));
+  CHECK(ask_panel(r, frame(CMD_GET_VENTILATION_LEVEL, {0})) == level_reply(4, 70));
+
+  // The panel can answer while such a command is on its way to the unit.
+  r.unit.tx.clear();
+  r.ha_set_level(2);
+  r.run(PROXY_IDLE_GAP_MS + 2);
+  CHECK(r.unit.tx == frame(CMD_SET_LEVEL, {2}));
+  CHECK(ask_panel(r, frame(CMD_GET_VENTILATION_LEVEL, {0})) == level_reply(2, 35));
+}
+
+// No polling, and an unknown level is never sent to the unit.
+static void test_write_only_does_not_poll()
+{
+  sim_preferences().clear();
+  Rig r(true, true);
+  for (int i = 0; i < 25; i++)
+  {
+    r.c.update();
+    r.run(2000);
+  }
+  CHECK(r.unit.tx.empty());
+  CHECK(r.c.fan_mode.value() == climate::CLIMATE_FAN_LOW);
+}
+
+static void test_write_only_resends_level()
+{
+  sim_preferences().clear();
+  Rig r(true, true);
+  r.ha_set_level(3);
+  r.c.update();
+  r.run(1000);
+  r.unit.tx.clear();
+  r.c.update();
+  r.run(1000);
+  CHECK(r.unit.tx.empty()); // not due yet
+  r.run(WRITE_ONLY_LEVEL_RESEND_MS);
+  r.c.update();
+  r.run(PROXY_IDLE_GAP_MS + 2);
+  CHECK(r.unit.tx == frame(CMD_SET_LEVEL, {3}));
+}
+
+static void test_write_only_remembers_across_restart()
+{
+  sim_preferences().clear();
+  {
+    Rig r(true, true);
+    r.panel.feed(frame(CMD_SET_LEVEL, {3}));
+    r.panel.feed(frame(CMD_SET_COMFORT_TEMPERATURE, {90}));
+    r.run(2);
+  }
+  Rig r(true, true);
+  CHECK(ask_panel(r, frame(CMD_GET_VENTILATION_LEVEL, {0})) == level_reply(3, 50));
+  CHECK(ask_panel(r, frame(CMD_GET_TEMPERATURES, {0})) == concat(ACK, frame(RES_GET_TEMPERATURES, {90, 90, 90, 90, 90, 0, 0, 0, 0})));
+  r.run(PROXY_IDLE_GAP_MS + 2);
+  r.unit.tx.clear();
+  r.c.update();
+  r.run(PROXY_IDLE_GAP_MS + 2);
+  CHECK(r.unit.tx == frame(CMD_SET_LEVEL, {3})); // puts a restarted unit back on the level
+  CHECK(r.c.fan_mode.value() == climate::CLIMATE_FAN_MEDIUM);
+}
+
+// Anything from the unit is dropped so that it can't collide with our replies.
+static void test_write_only_ignores_unit_bytes()
+{
+  sim_preferences().clear();
+  Rig r(true, true);
+  r.unit.feed(ACK);
+  r.unit.feed(frame(RES_GET_FAN_STATUS, {50, 50, 0, 0, 0, 0}));
+  r.run(2);
+  CHECK(r.panel.tx.empty());
+  CHECK(r.intake.publishes == 0);
+}
+
 int main()
 {
   test_transparent_relay();
@@ -544,6 +689,13 @@ int main()
   test_wiring_check_unit_swapped();
   test_wiring_check_panel_no_output();
   test_wiring_check_nothing_answers();
+  test_write_only_answers_panel();
+  test_write_only_panel_sets_level();
+  test_write_only_home_assistant_sets_level();
+  test_write_only_does_not_poll();
+  test_write_only_resends_level();
+  test_write_only_remembers_across_restart();
+  test_write_only_ignores_unit_bytes();
   std::printf("all proxy simulation tests passed\n");
   return 0;
 }

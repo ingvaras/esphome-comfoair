@@ -43,6 +43,8 @@ static const uint32_t TEST_PANEL_FRAME_INTERVAL_MS = 2000U;
 static const uint32_t WIRING_CHECK_DELAY_MS = 30000U;
 static const uint32_t WIRING_CHECK_TICK_MS = 1000U;
 static const int WIRING_CHECK_LISTEN_TICKS = 15;
+// unit_write_only: the unit can't confirm a level, so the remembered one is re-sent this often.
+static const uint32_t WRITE_ONLY_LEVEL_RESEND_MS = 300000U;
 static const uint8_t COMFOAIR_MIN_SUPPORTED_TEMP = 12;
 static const uint8_t COMFOAIR_MAX_SUPPORTED_TEMP = 29;
 static const float COMFOAIR_SUPPORTED_TEMP_STEP = 0.5f;
@@ -55,6 +57,13 @@ static_assert(MAX_MESSAGE_SIZE == PROXY_MAX_FRAME_SIZE, "proxy_bus.h frame size 
 static const char *TAG = "comfoair";
 
 class ComfoAirComponent;
+
+// What unit_write_only remembers across restarts, because the unit can't be asked.
+struct WriteOnlyState
+{
+  uint8_t level{0x02};   // low
+  uint8_t comfort{80U};  // 20 degrees C
+};
 
 class ComfoAirSizeSelect : public select::Select
 {
@@ -194,6 +203,11 @@ public:
     {
       ESP_LOGCONFIG(TAG, "  ComfoSense proxy: enabled (frames from Home Assistant wait for an idle bus)");
     }
+    if (unit_write_only_)
+    {
+      ESP_LOGCONFIG(TAG, "  Unit write-only: answering the panel from here, level %u, panel ACK %s",
+                    write_only_state_.level, panel_ack_seen_ ? "seen" : "not seen yet");
+    }
 #ifdef USE_ESP32
     if (wiring_check_running_)
     {
@@ -210,6 +224,16 @@ public:
   {
     boot_ms_ = millis();
     last_test_panel_frame_ms_ = boot_ms_;
+    if (unit_write_only_)
+    {
+      write_only_pref_ = global_preferences->make_preference<WriteOnlyState>(fnv1_hash("comfoair_write_only"), true);
+      WriteOnlyState stored;
+      if (write_only_pref_.load(&stored) && stored.level <= 4)
+      {
+        write_only_state_ = stored;
+        write_only_level_known_ = true;
+      }
+    }
     if (proxy_uart_ != nullptr)
     {
       // Relaying bytes between two UARTs needs a much faster loop than the default ~16ms.
@@ -221,6 +245,11 @@ public:
   {
     if (wiring_check_running_)
     {
+      return;
+    }
+    if (unit_write_only_)
+    {
+      write_only_update_();
       return;
     }
     ESP_LOGD(TAG, "Component update: %d", update_counter_);
@@ -374,6 +403,8 @@ public:
     wiring_check_pins_[3] = panel_tx;
     wiring_check_pending_ = true;
   }
+  // The unit's TX doesn't work: answer the panel from the ESP and only send commands to the unit.
+  void set_unit_write_only(bool value) { unit_write_only_ = value; }
   const WiringCheck &wiring_check() const { return wiring_check_; }
   bool wiring_check_running() const { return wiring_check_running_; }
   bool wiring_check_done() const { return wiring_check_done_; }
@@ -496,10 +527,23 @@ protected:
     {
       arbiter_.note_panel_byte(millis());
       log_raw_byte_(panel_raw_, "panel->unit", byte_u8);
-      // Track frames only to know when the bus is busy; the content is not used.
-      if (checkRx_(csRxBuffer_au8, &csRxIdx_u8, byte_u8) == RX_STATUS_RECEIVED_MESSAGE)
+      // Track frames to know when the bus is busy. Only unit_write_only uses the content.
+      const rx_status panel_status = checkRx_(csRxBuffer_au8, &csRxIdx_u8, byte_u8);
+      if (panel_status == RX_STATUS_RECEIVED_ACK && unit_write_only_ && !panel_ack_seen_)
       {
-        arbiter_.panel_frame_complete(millis());
+        panel_ack_seen_ = true;
+        ESP_LOGI(TAG, "Panel acknowledged a reply: the ESP -> panel link works");
+      }
+      if (panel_status == RX_STATUS_RECEIVED_MESSAGE)
+      {
+        if (unit_write_only_)
+        {
+          answer_panel_frame_(csRxBuffer_au8);
+        }
+        else
+        {
+          arbiter_.panel_frame_complete(millis());
+        }
         if (test_ack_panel_frames_)
         {
           // Acknowledge the frame ourselves, as the unit would. A panel that receives this
@@ -540,8 +584,18 @@ protected:
     // talking to us, so nothing is relayed to the panel.
     while (available() != 0 && read_byte(&byte_u8))
     {
-      arbiter_.note_unit_byte(millis());
       log_raw_byte_(unit_raw_, "unit->panel", byte_u8);
+      if (unit_write_only_)
+      {
+        // Never relayed: it would collide with the replies we send the panel.
+        if (!unit_byte_seen_)
+        {
+          unit_byte_seen_ = true;
+          ESP_LOGW(TAG, "Received data from the unit although unit_write_only is set; its TX may work after all");
+        }
+        continue;
+      }
+      arbiter_.note_unit_byte(millis());
       const bool own = arbiter_.own_exchange();
       if (!own)
       {
@@ -600,19 +654,170 @@ protected:
     {
       return;
     }
-    uint8_t message_au8[MAX_MESSAGE_SIZE]{};
-    message_au8[1] = RES_GET_TEMPERATURES;
-    message_au8[2] = 9;
     const uint8_t data[9] = {84, 63, 75, 83, 57, 0x0F, 0, 0, 0};
-    memcpy(&message_au8[3], data, sizeof(data));
+    proxy_uart_->write_byte(COMMAND_PREFIX);
+    proxy_uart_->write_byte(COMMAND_HEAD_ACK);
+    send_panel_frame_(RES_GET_TEMPERATURES, data, sizeof(data));
+    proxy_uart_->flush();
+    ESP_LOGI(TAG, "Test: answered ComfoSense temperature request with fake values");
+  }
+
+  void send_panel_frame_(uint8_t command, const uint8_t *data, uint8_t length)
+  {
+    uint8_t message_au8[MAX_MESSAGE_SIZE]{};
+    message_au8[1] = command;
+    message_au8[2] = length;
+    memcpy(&message_au8[3], data, length);
 
     uint8_t frame_au8[MAX_MESSAGE_SIZE];
     const uint8_t frame_len = encodeMessage_(message_au8, frame_au8);
+    proxy_uart_->write_array(frame_au8, frame_len);
+  }
+
+  // --- unit_write_only: the unit's TX doesn't work ---
+
+  // Act as the unit towards the panel: acknowledge every frame and answer what we can. The
+  // frame is also relayed to the unit, so the panel's commands still take effect. The unit's
+  // real values are unknown, so the replies report sensors absent, typical fan settings and
+  // no faults.
+  void answer_panel_frame_(const uint8_t *message_au8)
+  {
+    const uint8_t command = message_au8[1];
+    const uint8_t length = message_au8[2];
+    const uint8_t level = write_only_state_.level;
+    const uint8_t comfort = write_only_state_.comfort;
+
     proxy_uart_->write_byte(COMMAND_PREFIX);
     proxy_uart_->write_byte(COMMAND_HEAD_ACK);
-    proxy_uart_->write_array(frame_au8, frame_len);
-    proxy_uart_->flush();
-    ESP_LOGI(TAG, "Test: answered ComfoSense temperature request with fake values");
+
+    switch (command)
+    {
+    case CMD_SET_LEVEL:
+      if (length == CMD_SET_LEVEL_LENGTH)
+      {
+        remember_level_(message_au8[3]);
+      }
+      break;
+    case CMD_SET_COMFORT_TEMPERATURE:
+      if (length == CMD_SET_COMFORT_TEMPERATURE_LENGTH)
+      {
+        remember_comfort_(message_au8[3]);
+      }
+      break;
+    case CMD_GET_VENTILATION_LEVEL:
+    {
+      static const uint8_t LEVEL_PERCENT[5] = {35, 15, 35, 50, 70}; // auto, absent, low, medium, high
+      const uint8_t percent = LEVEL_PERCENT[level];
+      const uint8_t data[14] = {15, 35, 50, 15, 35, 50, percent, percent, level, 1, 70, 70, 0, 0};
+      send_panel_frame_(RES_GET_VENTILATION_LEVEL, data, sizeof(data));
+      break;
+    }
+    case CMD_GET_TEMPERATURES:
+    {
+      const uint8_t data[9] = {comfort, comfort, comfort, comfort, comfort, 0, 0, 0, 0};
+      send_panel_frame_(RES_GET_TEMPERATURES, data, sizeof(data));
+      break;
+    }
+    case CMD_GET_STATUS:
+    {
+      const uint8_t data[11] = {0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0};
+      send_panel_frame_(RES_GET_STATUS, data, sizeof(data));
+      break;
+    }
+    case CMD_GET_FAULTS:
+    {
+      const uint8_t data[17] = {};
+      send_panel_frame_(RES_GET_FAULTS, data, sizeof(data));
+      break;
+    }
+    case CMD_GET_RF_STATUS:
+    {
+      const uint8_t data[7] = {};
+      send_panel_frame_(RES_GET_RF_STATUS, data, sizeof(data));
+      break;
+    }
+    default:
+      if ((panel_commands_logged_[command / 8U] & (1U << (command % 8U))) == 0)
+      {
+        panel_commands_logged_[command / 8U] |= (1U << (command % 8U));
+        ESP_LOGI(TAG, "Panel command %02X: acknowledged, no reply format known", command);
+      }
+      break;
+    }
+  }
+
+  void apply_level_(uint8_t level)
+  {
+    if (ventilation_level != nullptr)
+    {
+      ventilation_level->publish_state(level == 0 ? 0 : level - 1);
+    }
+
+    // Fan Speed
+    switch (level)
+    {
+    case 0x00:
+      fan_mode = climate::CLIMATE_FAN_AUTO;
+      mode = climate::CLIMATE_MODE_FAN_ONLY;
+      break;
+    case 0x01:
+      fan_mode = climate::CLIMATE_FAN_OFF;
+      mode = climate::CLIMATE_MODE_OFF;
+      break;
+    case 0x02:
+      fan_mode = climate::CLIMATE_FAN_LOW;
+      mode = climate::CLIMATE_MODE_FAN_ONLY;
+      break;
+    case 0x03:
+      fan_mode = climate::CLIMATE_FAN_MEDIUM;
+      mode = climate::CLIMATE_MODE_FAN_ONLY;
+      break;
+    case 0x04:
+      fan_mode = climate::CLIMATE_FAN_HIGH;
+      mode = climate::CLIMATE_MODE_FAN_ONLY;
+      break;
+    }
+  }
+
+  void remember_level_(uint8_t level)
+  {
+    if (level > 4)
+    {
+      return;
+    }
+    write_only_level_known_ = true;
+    write_only_level_sent_ms_ = millis();
+    write_only_state_.level = level;
+    write_only_pref_.save(&write_only_state_);
+    apply_level_(level);
+    publish_state();
+  }
+
+  void remember_comfort_(uint8_t comfort)
+  {
+    write_only_state_.comfort = comfort;
+    write_only_pref_.save(&write_only_state_);
+    target_temperature = (float)comfort / 2.0f - 20.0f;
+    publish_state();
+  }
+
+  // Polling is pointless without replies. This only keeps the unit on the remembered level.
+  void write_only_update_()
+  {
+    const uint32_t now = millis();
+    const bool first_update = !write_only_started_;
+    if (first_update)
+    {
+      write_only_started_ = true;
+      apply_level_(write_only_state_.level);
+      target_temperature = (float)write_only_state_.comfort / 2.0f - 20.0f;
+      publish_state();
+    }
+    if (write_only_level_known_ && (first_update || (now - write_only_level_sent_ms_) >= WRITE_ONLY_LEVEL_RESEND_MS))
+    {
+      write_only_level_sent_ms_ = now;
+      write_command_(CMD_SET_LEVEL, &write_only_state_.level, CMD_SET_LEVEL_LENGTH);
+    }
   }
 
   // Hardware test aid (test_panel_frame: true): send the panel a frame a real unit sends it
@@ -665,12 +870,16 @@ protected:
     caRxIdx_u8 = 0;
     if (!success)
     {
+      // With unit_write_only no answer can arrive, so every command simply goes out twice.
       if (inflight_attempts_ < 2)
       {
-        ESP_LOGD(TAG, "Proxy: no answer to cmd %02X, retrying", inflight_.command());
+        if (!unit_write_only_)
+        {
+          ESP_LOGD(TAG, "Proxy: no answer to cmd %02X, retrying", inflight_.command());
+        }
         retry_pending_ = true;
       }
-      else
+      else if (!unit_write_only_)
       {
         ESP_LOGW(TAG, "Proxy: no answer to cmd %02X, giving up", inflight_.command());
       }
@@ -962,6 +1171,10 @@ protected:
     }
 
     ESP_LOGI(TAG, "Setting level to: %i", level);
+    if (unit_write_only_)
+    {
+      remember_level_(level);
+    }
     {
       uint8_t command[CMD_SET_LEVEL_LENGTH] = {(uint8_t)level};
       write_command_(CMD_SET_LEVEL, command, sizeof(command));
@@ -977,6 +1190,10 @@ protected:
     }
 
     ESP_LOGI(TAG, "Setting temperature to: %.1f", temperature);
+    if (unit_write_only_)
+    {
+      remember_comfort_((uint8_t)((temperature + 20.0f) * 2.0f));
+    }
     {
       uint8_t command[CMD_SET_COMFORT_TEMPERATURE_LENGTH] = {(uint8_t)((temperature + 20.0f) * 2.0f)};
       write_command_(CMD_SET_COMFORT_TEMPERATURE, command, sizeof(command));
@@ -1427,35 +1644,7 @@ protected:
         supply_air_level->publish_state(msg_data[7]);
       }
 
-      if (ventilation_level != nullptr)
-      {
-        ventilation_level->publish_state(msg_data[8] == 0 ? 0 : msg_data[8] - 1);
-      }
-
-      // Fan Speed
-      switch (msg_data[8])
-      {
-      case 0x00:
-        fan_mode = climate::CLIMATE_FAN_AUTO;
-        mode = climate::CLIMATE_MODE_FAN_ONLY;
-        break;
-      case 0x01:
-        fan_mode = climate::CLIMATE_FAN_OFF;
-        mode = climate::CLIMATE_MODE_OFF;
-        break;
-      case 0x02:
-        fan_mode = climate::CLIMATE_FAN_LOW;
-        mode = climate::CLIMATE_MODE_FAN_ONLY;
-        break;
-      case 0x03:
-        fan_mode = climate::CLIMATE_FAN_MEDIUM;
-        mode = climate::CLIMATE_MODE_FAN_ONLY;
-        break;
-      case 0x04:
-        fan_mode = climate::CLIMATE_FAN_HIGH;
-        mode = climate::CLIMATE_MODE_FAN_ONLY;
-        break;
-      }
+      apply_level_(msg_data[8]);
 
       if (return_air_level_absent != nullptr)
         return_air_level_absent->publish_state(msg_data[0]);
@@ -1971,6 +2160,15 @@ protected:
   bool test_ack_panel_frames_{false};
   uint32_t last_test_panel_frame_ms_{0};
   uint32_t boot_ms_{0};
+  bool unit_write_only_{false};
+  bool write_only_started_{false};
+  bool write_only_level_known_{false};
+  uint32_t write_only_level_sent_ms_{0};
+  WriteOnlyState write_only_state_;
+  ESPPreferenceObject write_only_pref_;
+  bool panel_ack_seen_{false};
+  bool unit_byte_seen_{false};
+  uint8_t panel_commands_logged_[32]{};
   WiringCheck wiring_check_;
   uint8_t wiring_check_pins_[WiringCheck::PIN_COUNT]{};
   bool wiring_check_pending_{false};
