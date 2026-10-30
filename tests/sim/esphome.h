@@ -254,7 +254,8 @@ namespace climate
 enum ClimateMode
 {
   CLIMATE_MODE_OFF,
-  CLIMATE_MODE_FAN_ONLY
+  CLIMATE_MODE_FAN_ONLY,
+  CLIMATE_MODE_COOL
 };
 enum ClimateFanMode
 {
@@ -277,11 +278,13 @@ struct ClimateTraits
 {
   void add_feature_flags(ClimateFeature) {}
   void clear_feature_flags(ClimateFeature) {}
-  void set_supported_modes(std::set<ClimateMode>) {}
-  void set_supported_fan_modes(std::set<ClimateFanMode>) {}
+  void set_supported_modes(std::set<ClimateMode> value) { modes = value; }
+  void set_supported_fan_modes(std::set<ClimateFanMode> value) { fan_modes = value; }
   void set_visual_min_temperature(float) {}
   void set_visual_max_temperature(float) {}
   void set_visual_temperature_step(float) {}
+  std::set<ClimateMode> modes;
+  std::set<ClimateFanMode> fan_modes;
 };
 template <typename T> struct Opt
 {
@@ -299,8 +302,10 @@ template <typename T> struct Opt
 };
 struct ClimateCall
 {
+  Opt<ClimateMode> hvac;
   Opt<ClimateFanMode> fan;
   Opt<float> temp;
+  const Opt<ClimateMode> &get_mode() const { return hvac; }
   const Opt<ClimateFanMode> &get_fan_mode() const { return fan; }
   const Opt<float> &get_target_temperature() const { return temp; }
 };

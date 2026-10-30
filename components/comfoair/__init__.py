@@ -63,6 +63,7 @@ CONF_TEST_PANEL_FRAME = "test_panel_frame"
 CONF_TEST_ACK_PANEL_FRAMES = "test_ack_panel_frames"
 CONF_WIRING_CHECK = "wiring_check"
 CONF_UNIT_WRITE_ONLY = "unit_write_only"
+CONF_HOMEKIT_CLIMATE = "homekit_climate"
 
 UNIT_WEEK = "weeks"
 
@@ -732,6 +733,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_TEST_ACK_PANEL_FRAMES, default=False): cv.boolean,
             cv.Optional(CONF_WIRING_CHECK, default=True): cv.boolean,
             cv.Optional(CONF_UNIT_WRITE_ONLY, default=False): cv.boolean,
+            cv.Optional(CONF_HOMEKIT_CLIMATE, default=False): cv.boolean,
         }
     )
     .extend(uart.UART_DEVICE_SCHEMA)
@@ -761,6 +763,7 @@ def to_code(config):
     cg.add(var.set_test_panel_frame(config[CONF_TEST_PANEL_FRAME]))
     cg.add(var.set_test_ack_panel_frames(config[CONF_TEST_ACK_PANEL_FRAMES]))
     cg.add(var.set_unit_write_only(config[CONF_UNIT_WRITE_ONLY]))
+    cg.add(var.set_homekit_climate(config[CONF_HOMEKIT_CLIMATE]))
     if CONF_PROXY_UART_ID in config:
         proxy_paren = yield cg.get_variable(config[CONF_PROXY_UART_ID])
         cg.add(var.set_proxy_uart(proxy_paren))

@@ -109,6 +109,14 @@ temperatures, fan speeds, filter status, bypass and faults. The panel gets no
 replies, so expect it to show a communication error. **Real alarms from the unit
 stay hidden.**
 
+**One HomeKit tile (`homekit_climate: true`):** Home Assistant's HomeKit bridge
+shows a fan-only climate entity with a two-ended temperature range and no speed
+slider. With this option the entity has the modes Off and Cool and the speeds Low,
+Medium and High, so one tile has a single target temperature and a speed slider.
+Off sends the Absent level, because the unit has no real off, and turning it back
+on starts at Low. Auto is no longer offered. Cool doesn't mean active cooling: the
+target is the comfort temperature, which steers the summer bypass.
+
 Port of the ComfoAir protocol to ESPHome.io firmware, which is supported by external_components.
 
 The component sends one protocol request every two seconds. After the initial

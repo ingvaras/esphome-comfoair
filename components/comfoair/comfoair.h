@@ -129,12 +129,33 @@ public:
         climate::CLIMATE_FAN_HIGH,
         climate::CLIMATE_FAN_OFF,
     });
+    if (homekit_climate_)
+    {
+      // HomeKit gives fan-only a two-ended range, and an auto fan moves the speed slider off the tile.
+      traits.set_supported_modes({climate::CLIMATE_MODE_OFF, climate::CLIMATE_MODE_COOL});
+      traits.set_supported_fan_modes({
+          climate::CLIMATE_FAN_LOW,
+          climate::CLIMATE_FAN_MEDIUM,
+          climate::CLIMATE_FAN_HIGH,
+      });
+    }
     return traits;
   }
 
   // Override control to change settings of the climate device.
   void control(const climate::ClimateCall &call) override
   {
+    if (homekit_climate_ && call.get_mode().has_value() && !call.get_fan_mode().has_value())
+    {
+      // The unit has no off, so Off is the Absent level. Turning back on starts at Low.
+      const bool off = *call.get_mode() == climate::CLIMATE_MODE_OFF;
+      if (off || mode == climate::CLIMATE_MODE_OFF)
+      {
+        const uint8_t level = off ? 0x01 : 0x02;
+        set_level_(level);
+        apply_level_(level);
+      }
+    }
     if (call.get_fan_mode().has_value())
     {
       int level;
@@ -168,6 +189,10 @@ public:
       if (level >= 0)
       {
         set_level_(level);
+        if (homekit_climate_)
+        {
+          apply_level_(level);
+        }
       }
     }
     if (call.get_target_temperature().has_value())
@@ -207,6 +232,10 @@ public:
     {
       ESP_LOGCONFIG(TAG, "  Unit write-only: commands only, nothing is sent to the panel, level %u",
                     write_only_state_.level);
+    }
+    if (homekit_climate_)
+    {
+      ESP_LOGCONFIG(TAG, "  HomeKit climate: modes Off and Cool, no auto fan");
     }
 #ifdef USE_ESP32
     if (wiring_check_running_)
@@ -405,6 +434,7 @@ public:
   }
   // The unit can't answer: only send it commands, and relay the panel's. Nothing goes to the panel.
   void set_unit_write_only(bool value) { unit_write_only_ = value; }
+  void set_homekit_climate(bool value) { homekit_climate_ = value; }
   const WiringCheck &wiring_check() const { return wiring_check_; }
   bool wiring_check_running() const { return wiring_check_running_; }
   bool wiring_check_done() const { return wiring_check_done_; }
@@ -716,6 +746,10 @@ protected:
       fan_mode = climate::CLIMATE_FAN_HIGH;
       mode = climate::CLIMATE_MODE_FAN_ONLY;
       break;
+    }
+    if (homekit_climate_ && mode == climate::CLIMATE_MODE_FAN_ONLY)
+    {
+      mode = climate::CLIMATE_MODE_COOL;
     }
   }
 
@@ -2101,6 +2135,7 @@ protected:
   uint32_t last_test_panel_frame_ms_{0};
   uint32_t boot_ms_{0};
   bool unit_write_only_{false};
+  bool homekit_climate_{false};
   bool write_only_started_{false};
   bool write_only_level_known_{false};
   uint32_t write_only_level_sent_ms_{0};

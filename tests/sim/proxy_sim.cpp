@@ -653,6 +653,112 @@ static void test_write_only_ignores_unit_bytes()
   CHECK(r.intake.publishes == 0);
 }
 
+// --- homekit_climate: Off and Cool instead of fan only, and no auto fan ---
+
+static void homekit_set_mode(Rig &r, climate::ClimateMode mode)
+{
+  climate::ClimateCall call;
+  call.hvac = mode;
+  r.c.control(call);
+}
+
+static void homekit_set_fan(Rig &r, climate::ClimateFanMode fan)
+{
+  climate::ClimateCall call;
+  call.fan = fan;
+  r.c.control(call);
+}
+
+// Each command goes out twice in write-only mode.
+static void check_level_sent(Rig &r, uint8_t level)
+{
+  r.run(2 * PROXY_OWN_EXCHANGE_TIMEOUT_MS + 50);
+  const Bytes command = frame(CMD_SET_LEVEL, {level});
+  CHECK(r.unit.tx == concat(command, command));
+  r.unit.tx.clear();
+}
+
+static void test_homekit_climate_traits()
+{
+  sim_preferences().clear();
+  Rig r(true, true);
+  CHECK(r.c.traits().modes == std::set<climate::ClimateMode>{climate::CLIMATE_MODE_FAN_ONLY});
+  CHECK(r.c.traits().fan_modes.count(climate::CLIMATE_FAN_AUTO) == 1);
+  r.c.set_homekit_climate(true);
+  CHECK(r.c.traits().modes == (std::set<climate::ClimateMode>{climate::CLIMATE_MODE_OFF, climate::CLIMATE_MODE_COOL}));
+  CHECK(r.c.traits().fan_modes == (std::set<climate::ClimateFanMode>{climate::CLIMATE_FAN_LOW, climate::CLIMATE_FAN_MEDIUM,
+                                                                     climate::CLIMATE_FAN_HIGH}));
+}
+
+static void test_homekit_climate_off_is_absent()
+{
+  sim_preferences().clear();
+  Rig r(true, true);
+  r.c.set_homekit_climate(true);
+
+  homekit_set_mode(r, climate::CLIMATE_MODE_OFF);
+  check_level_sent(r, 1);
+  CHECK(r.c.mode == climate::CLIMATE_MODE_OFF);
+  CHECK(r.c.fan_mode.value() == climate::CLIMATE_FAN_OFF);
+
+  homekit_set_mode(r, climate::CLIMATE_MODE_COOL);
+  check_level_sent(r, 2);
+  CHECK(r.c.mode == climate::CLIMATE_MODE_COOL);
+  CHECK(r.c.fan_mode.value() == climate::CLIMATE_FAN_LOW);
+
+  // HomeKit repeats the mode it already has: the running level must stay.
+  homekit_set_fan(r, climate::CLIMATE_FAN_HIGH);
+  check_level_sent(r, 4);
+  homekit_set_mode(r, climate::CLIMATE_MODE_COOL);
+  r.run(2 * PROXY_OWN_EXCHANGE_TIMEOUT_MS + 50);
+  CHECK(r.unit.tx.empty());
+  CHECK(r.c.fan_mode.value() == climate::CLIMATE_FAN_HIGH);
+
+  // Moving the speed slider while off turns it on.
+  homekit_set_mode(r, climate::CLIMATE_MODE_OFF);
+  check_level_sent(r, 1);
+  homekit_set_fan(r, climate::CLIMATE_FAN_MEDIUM);
+  check_level_sent(r, 3);
+  CHECK(r.c.mode == climate::CLIMATE_MODE_COOL);
+}
+
+static void test_homekit_climate_follows_panel()
+{
+  sim_preferences().clear();
+  Rig r(true, true);
+  r.c.set_homekit_climate(true);
+  r.panel.feed(frame(CMD_SET_LEVEL, {3}));
+  r.run(2);
+  CHECK(r.c.mode == climate::CLIMATE_MODE_COOL);
+  r.panel.feed(frame(CMD_SET_LEVEL, {1}));
+  r.run(2);
+  CHECK(r.c.mode == climate::CLIMATE_MODE_OFF);
+}
+
+// Without unit_write_only the unit reports the level later, but Off has to show at once.
+static void test_homekit_climate_shows_off_at_once()
+{
+  sim_preferences().clear();
+  Rig r(true);
+  r.c.set_homekit_climate(true);
+  homekit_set_mode(r, climate::CLIMATE_MODE_OFF);
+  CHECK(r.c.mode == climate::CLIMATE_MODE_OFF);
+  r.run(PROXY_IDLE_GAP_MS + 2);
+  CHECK(r.unit.tx == frame(CMD_SET_LEVEL, {1}));
+}
+
+static void test_fan_only_without_homekit_climate()
+{
+  sim_preferences().clear();
+  Rig r(true, true);
+  homekit_set_mode(r, climate::CLIMATE_MODE_COOL); // ignored
+  r.run(2 * PROXY_OWN_EXCHANGE_TIMEOUT_MS + 50);
+  CHECK(r.unit.tx.empty());
+  r.panel.feed(frame(CMD_SET_LEVEL, {3}));
+  r.run(2);
+  CHECK(r.c.mode == climate::CLIMATE_MODE_FAN_ONLY);
+}
+
 int main()
 {
   test_transparent_relay();
@@ -674,6 +780,11 @@ int main()
   test_write_only_resends_level();
   test_write_only_remembers_across_restart();
   test_write_only_ignores_unit_bytes();
+  test_homekit_climate_traits();
+  test_homekit_climate_off_is_absent();
+  test_homekit_climate_follows_panel();
+  test_homekit_climate_shows_off_at_once();
+  test_fan_only_without_homekit_climate();
   std::printf("all proxy simulation tests passed\n");
   return 0;
 }
