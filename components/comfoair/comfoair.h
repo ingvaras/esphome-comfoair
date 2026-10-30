@@ -205,8 +205,8 @@ public:
     }
     if (unit_write_only_)
     {
-      ESP_LOGCONFIG(TAG, "  Unit write-only: answering the panel from here, level %u, panel ACK %s",
-                    write_only_state_.level, panel_ack_seen_ ? "seen" : "not seen yet");
+      ESP_LOGCONFIG(TAG, "  Unit write-only: commands only, nothing is sent to the panel, level %u",
+                    write_only_state_.level);
     }
 #ifdef USE_ESP32
     if (wiring_check_running_)
@@ -403,7 +403,7 @@ public:
     wiring_check_pins_[3] = panel_tx;
     wiring_check_pending_ = true;
   }
-  // The unit's TX doesn't work: answer the panel from the ESP and only send commands to the unit.
+  // The unit can't answer: only send it commands, and relay the panel's. Nothing goes to the panel.
   void set_unit_write_only(bool value) { unit_write_only_ = value; }
   const WiringCheck &wiring_check() const { return wiring_check_; }
   bool wiring_check_running() const { return wiring_check_running_; }
@@ -528,17 +528,11 @@ protected:
       arbiter_.note_panel_byte(millis());
       log_raw_byte_(panel_raw_, "panel->unit", byte_u8);
       // Track frames to know when the bus is busy. Only unit_write_only uses the content.
-      const rx_status panel_status = checkRx_(csRxBuffer_au8, &csRxIdx_u8, byte_u8);
-      if (panel_status == RX_STATUS_RECEIVED_ACK && unit_write_only_ && !panel_ack_seen_)
-      {
-        panel_ack_seen_ = true;
-        ESP_LOGI(TAG, "Panel acknowledged a reply: the ESP -> panel link works");
-      }
-      if (panel_status == RX_STATUS_RECEIVED_MESSAGE)
+      if (checkRx_(csRxBuffer_au8, &csRxIdx_u8, byte_u8) == RX_STATUS_RECEIVED_MESSAGE)
       {
         if (unit_write_only_)
         {
-          answer_panel_frame_(csRxBuffer_au8);
+          note_panel_frame_(csRxBuffer_au8);
         }
         else
         {
@@ -587,7 +581,7 @@ protected:
       log_raw_byte_(unit_raw_, "unit->panel", byte_u8);
       if (unit_write_only_)
       {
-        // Never relayed: it would collide with the replies we send the panel.
+        // Nothing goes to the panel in this mode.
         if (!unit_byte_seen_)
         {
           unit_byte_seen_ = true;
@@ -676,73 +670,19 @@ protected:
 
   // --- unit_write_only: the unit's TX doesn't work ---
 
-  // Act as the unit towards the panel: acknowledge every frame and answer what we can. The
-  // frame is also relayed to the unit, so the panel's commands still take effect. The unit's
-  // real values are unknown, so the replies report sensors absent, typical fan settings and
-  // no faults.
-  void answer_panel_frame_(const uint8_t *message_au8)
+  // Keep up with what the panel commands. The frame itself is relayed to the unit as usual.
+  void note_panel_frame_(const uint8_t *message_au8)
   {
     const uint8_t command = message_au8[1];
     const uint8_t length = message_au8[2];
-    const uint8_t level = write_only_state_.level;
-    const uint8_t comfort = write_only_state_.comfort;
-
-    proxy_uart_->write_byte(COMMAND_PREFIX);
-    proxy_uart_->write_byte(COMMAND_HEAD_ACK);
-
-    switch (command)
+    if (command == CMD_SET_LEVEL && length == CMD_SET_LEVEL_LENGTH)
     {
-    case CMD_SET_LEVEL:
-      if (length == CMD_SET_LEVEL_LENGTH)
-      {
-        remember_level_(message_au8[3]);
-      }
-      break;
-    case CMD_SET_COMFORT_TEMPERATURE:
-      if (length == CMD_SET_COMFORT_TEMPERATURE_LENGTH)
-      {
-        remember_comfort_(message_au8[3]);
-      }
-      break;
-    case CMD_GET_VENTILATION_LEVEL:
-    {
-      static const uint8_t LEVEL_PERCENT[5] = {35, 15, 35, 50, 70}; // auto, absent, low, medium, high
-      const uint8_t percent = LEVEL_PERCENT[level];
-      const uint8_t data[14] = {15, 35, 50, 15, 35, 50, percent, percent, level, 1, 70, 70, 0, 0};
-      send_panel_frame_(RES_GET_VENTILATION_LEVEL, data, sizeof(data));
-      break;
+      ESP_LOGI(TAG, "Panel set level to: %u", message_au8[3]);
+      remember_level_(message_au8[3]);
     }
-    case CMD_GET_TEMPERATURES:
+    else if (command == CMD_SET_COMFORT_TEMPERATURE && length == CMD_SET_COMFORT_TEMPERATURE_LENGTH)
     {
-      const uint8_t data[9] = {comfort, comfort, comfort, comfort, comfort, 0, 0, 0, 0};
-      send_panel_frame_(RES_GET_TEMPERATURES, data, sizeof(data));
-      break;
-    }
-    case CMD_GET_STATUS:
-    {
-      const uint8_t data[11] = {0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0};
-      send_panel_frame_(RES_GET_STATUS, data, sizeof(data));
-      break;
-    }
-    case CMD_GET_FAULTS:
-    {
-      const uint8_t data[17] = {};
-      send_panel_frame_(RES_GET_FAULTS, data, sizeof(data));
-      break;
-    }
-    case CMD_GET_RF_STATUS:
-    {
-      const uint8_t data[7] = {};
-      send_panel_frame_(RES_GET_RF_STATUS, data, sizeof(data));
-      break;
-    }
-    default:
-      if ((panel_commands_logged_[command / 8U] & (1U << (command % 8U))) == 0)
-      {
-        panel_commands_logged_[command / 8U] |= (1U << (command % 8U));
-        ESP_LOGI(TAG, "Panel command %02X: acknowledged, no reply format known", command);
-      }
-      break;
+      remember_comfort_(message_au8[3]);
     }
   }
 
@@ -2166,9 +2106,7 @@ protected:
   uint32_t write_only_level_sent_ms_{0};
   WriteOnlyState write_only_state_;
   ESPPreferenceObject write_only_pref_;
-  bool panel_ack_seen_{false};
   bool unit_byte_seen_{false};
-  uint8_t panel_commands_logged_[32]{};
   WiringCheck wiring_check_;
   uint8_t wiring_check_pins_[WiringCheck::PIN_COUNT]{};
   bool wiring_check_pending_{false};
