@@ -687,7 +687,7 @@ static void test_homekit_climate_traits()
   r.c.set_homekit_climate(true);
   CHECK(r.c.traits().modes == (std::set<climate::ClimateMode>{climate::CLIMATE_MODE_OFF, climate::CLIMATE_MODE_COOL}));
   CHECK(r.c.traits().fan_modes == (std::set<climate::ClimateFanMode>{climate::CLIMATE_FAN_LOW, climate::CLIMATE_FAN_MEDIUM,
-                                                                     climate::CLIMATE_FAN_HIGH}));
+                                                                     climate::CLIMATE_FAN_HIGH, climate::CLIMATE_FAN_OFF}));
 }
 
 static void test_homekit_climate_off_is_absent()
@@ -720,6 +720,12 @@ static void test_homekit_climate_off_is_absent()
   homekit_set_fan(r, climate::CLIMATE_FAN_MEDIUM);
   check_level_sent(r, 3);
   CHECK(r.c.mode == climate::CLIMATE_MODE_COOL);
+
+  // The speed slider at zero sends fan Off, which is the same as the Off mode.
+  homekit_set_fan(r, climate::CLIMATE_FAN_OFF);
+  check_level_sent(r, 1);
+  CHECK(r.c.mode == climate::CLIMATE_MODE_OFF);
+  CHECK(r.c.fan_mode.value() == climate::CLIMATE_FAN_OFF);
 }
 
 static void test_homekit_climate_follows_panel()

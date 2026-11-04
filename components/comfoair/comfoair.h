@@ -132,11 +132,13 @@ public:
     if (homekit_climate_)
     {
       // HomeKit gives fan-only a two-ended range, and an auto fan moves the speed slider off the tile.
+      // Without a fan Off, HomeKit snaps the slider back from zero instead of turning the unit off.
       traits.set_supported_modes({climate::CLIMATE_MODE_OFF, climate::CLIMATE_MODE_COOL});
       traits.set_supported_fan_modes({
           climate::CLIMATE_FAN_LOW,
           climate::CLIMATE_FAN_MEDIUM,
           climate::CLIMATE_FAN_HIGH,
+          climate::CLIMATE_FAN_OFF,
       });
     }
     return traits;

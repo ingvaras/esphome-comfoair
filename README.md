@@ -114,7 +114,8 @@ shows a fan-only climate entity with a two-ended temperature range and no speed
 slider. With this option the entity has the modes Off and Cool and the speeds Low,
 Medium and High, so one tile has a single target temperature and a speed slider.
 Off sends the Absent level, because the unit has no real off, and turning it back
-on starts at Low. Auto is no longer offered. Cool doesn't mean active cooling: the
+on starts at Low. Dragging the speed slider to zero does the same as Off. Auto is
+no longer offered. Cool doesn't mean active cooling: the
 target is the comfort temperature, which steers the summer bypass.
 
 Port of the ComfoAir protocol to ESPHome.io firmware, which is supported by external_components.
